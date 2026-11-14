@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/crema-mascot.png" alt="crema mascot" width="220" />
+</p>
+
 # crema
 
 > *Crema is the thin golden layer on top of an espresso — just like the thin writable filesystem layer sitting on top of a heavy GPU base image.*
