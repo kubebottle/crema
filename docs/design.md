@@ -2,6 +2,10 @@
 
 > *Crema is the thin golden layer on top of an espresso — just like the thin writable filesystem layer sitting on top of a heavy GPU base image.*
 
+> **Design proposal, not an implemented API.** This document is for engineers familiar with Kubernetes who want to evaluate crema's rootfs persistence model. The repository currently contains design documentation, not a controller or agent implementation.
+
+The central rule is **publish the image, persist the operation result, then replace the Pod**. OCI images preserve the workspace rootfs; PVCs preserve separately mounted data. Neither mechanism checkpoints processes or GPU memory. The MVP targets Linux/containerd with OverlayFS, a single workspace container, and a registry reachable by both agents and node runtimes.
+
 ## 1. Background & Problem Statement
 
 In interactive GPU development (ML research, fine-tuning, inference debugging), engineers routinely:
@@ -16,7 +20,7 @@ On standard Kubernetes, a Pod's writable container layer (`OverlayFS UpperDir`) 
 
 ## 2. Design Options & Trade-off Analysis
 
-Before settling on an architecture, we evaluated three implementation routes:
+The following design alternatives motivate the proposed architecture; compatibility and performance still require implementation tests.
 
 ### Option A: Block-Device Rootfs + Hypervisor Isolation (KubeBrain-style)
 - **Mechanism**: Convert container images into Ceph RBD block devices via `ImageVolumeSnapshot`, mount the RBD directly as the `/` rootfs of a Kata Containers VM (GPU-less Master Pod), and attach GPU Worker Pods over NFS/RDMA.
@@ -36,15 +40,16 @@ Before settling on an architecture, we evaluated three implementation routes:
 - **Mechanism**:
   1. Before scaling GPUs, pausing, or manually snapshotting, the Node Agent on the Pod's node uses `containerd`'s native `diff` / `snapshotter` APIs to extract **only the writable delta** (`active` snapshot vs. its parent snapshot) into a single incremental OCI layer. `containerd` natively converts kernel whiteouts into standard OCI `.wh.*` files.
   2. The delta tar stream is compressed with **concurrent `zstd`**.
-  3. The Node Agent constructs a new OCI Image Manifest reusing the base image's existing layer digests + appending the single new delta layer digest, and pushes it to an OCI Registry. Thanks to OCI blob digest deduplication (`HEAD` check), **multi-GB CUDA/PyTorch base layers are never re-uploaded**—only the user's delta (typically tens to hundreds of MB) is transferred.
+  3. The Node Agent constructs a new OCI image config and manifest, preserving parent layers and appending the new delta. It checks blobs in the **target repository**: reuse existing blobs, attempt a supported cross-repository mount, or copy missing parent blobs. Only commits whose parent blobs are already available can transfer just the delta; the first commit may need to transfer the full base image.
   4. The `GPUWorkspace` Controller records the new immutable image reference in `status`, then recreates the Pod using the new image and updated GPU/scheduling spec.
 - **Pros**:
-  - **100% Kubernetes-native**: No `kubelet` patches, no custom CRI/runtime fork, works with standard `containerd`, NVIDIA GPU Operator, HAMi, Volcano, and `kind`.
+  - **Kubernetes-native restore path**: No `kubelet` patches or custom CRI/runtime fork are planned. MVP support is scoped to Linux/containerd with OverlayFS; NVIDIA GPU Operator, HAMi, and Volcano integrations need separate validation rather than implied compatibility.
   - **Clean restore semantics**: `kubelet` pulls/unpacks the OCI image normally before starting the container—zero OverlayFS UB.
-  - **Cross-node migration & rollback for free**: Any node can pull the committed OCI image, and every revision is an immutable image digest.
+  - **Portable rootfs revisions**: Compatible nodes can pull an immutable image digest. Cross-node restoration also requires compatible CPU architecture, runtime, GPU drivers, and PVC topology/access modes.
 - **Cons / Accepted Trade-offs**:
   - Requires an OCI Registry accessible from cluster nodes (can be an in-cluster registry or external registry).
   - Repeated commits accumulate layers (mitigated by future optional layer squashing if layer count exceeds a threshold).
+  - A filesystem freeze is not an application-consistent backup. Recreate operations must prevent writes between snapshot capture and old-container termination, and bound how long that write-quiescence window lasts.
 
 ### Comparison with Adjacent Systems
 
@@ -53,7 +58,7 @@ Before settling on an architecture, we evaluated three implementation routes:
 | **`gpu-docker-api`** | Rootfs (`MergedDir` copy) + volumes | Single-host Docker + etcd | No (single host) | Yes (single host) |
 | **K8s Checkpoint (CRIU)** | Memory + process + rootfs delta | CRIU + kubelet feature gate | Fragile (CUDA driver/GPU context state) | No |
 | **KubeBrain Workspace** | Block-device rootfs (RBD) | Kata Containers + Ceph RBD + custom agent | Tied to Ceph zone | Via Master/Worker split |
-| **`crema` (Option C)** | **Rootfs delta (OCI layer) + PVCs** | **Standard K8s + `containerd` + OCI Registry** | **Yes (via OCI Registry)** | **Yes (native Pod recreate)** |
+| **`crema` (Option C, proposed)** | **Rootfs revisions + independent PVC data** | **Linux/containerd + OverlayFS + OCI Registry** | **Rootfs portable; runtime and PVC constraints apply** | **Planned via Pod recreate** |
 
 ---
 
@@ -63,7 +68,7 @@ Before settling on an architecture, we evaluated three implementation routes:
 - Declarative `GPUWorkspace` CRD supporting create, GPU scaling (`0 ↔ N`), pause/resume, manual snapshot, and revision rollback.
 - `crema-controller` managing the `GPUWorkspace` lifecycle, Pod/PVC orchestration, and revision history.
 - `crema-agent` (DaemonSet) communicating with `containerd` (via `/run/containerd/containerd.sock`) to pause, diff, `zstd`-compress, and push incremental OCI images.
-- End-to-end verification in local `kind` (`containerd`) + in-cluster OCI Registry with simulated `nvidia.com/gpu` resources.
+- End-to-end verification in local `kind` (`containerd`) + an OCI registry with mock device-plugin resources. This verifies lifecycle/scheduling, not CUDA compatibility.
 
 ### Non-Goals (explicitly out of scope for MVP)
 - **Live process / CUDA memory checkpointing (CRIU)**: `crema` persists filesystem state (rootfs + PVCs), not in-memory GPU tensors or running processes across Pod recreation.
@@ -75,107 +80,106 @@ Before settling on an architecture, we evaluated three implementation routes:
 
 ## 4. System Architecture
 
+### Control Flow: Desired State and Pod Lifecycle
+
+The controller manages Kubernetes objects; it never writes directly into a replacement container's filesystem. Agent discovery selects the Pod on the workspace's assigned node. The scheduler binds the replacement Pod, while GPU device allocation remains a node/device-plugin concern.
+
 ```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"diagramPadding": 24}}}%%
 flowchart TB
-    User["User / kubectl / Platform API"] -->|Apply GPUWorkspace CRD| APIServer["Kubernetes API Server"]
+    User["User / Platform API"] -->|Apply spec| API["Kubernetes API"]
+    API <-->|Watch / status| Controller["crema-controller"]
+    Controller -->|Pod lifecycle| API
+    API -->|Unscheduled Pod| Scheduler["Kubernetes scheduler"]
+    Scheduler -->|Bind node| API
+    API -->|Assigned Pod| Kubelet["kubelet"]
+    Kubelet -->|CRI| Runtime["containerd"]
+    Runtime --> Pod["Workspace Pod"]
+    Controller -.->|Commit RPC| Agent["Node-local crema-agent"]
+```
 
-    subgraph ControlPlane["Control Plane (crema-controller Deployment)"]
-        Reconciler["GPUWorkspace Reconciler & State Machine"]
-        PodOrch["Pod & PVC Orchestrator (Recreate + Soft Node Affinity)"]
-        RevMgr["Revision History & GC Manager"]
-        Reconciler --> PodOrch
-        Reconciler --> RevMgr
+### Data Flow: Capture and Restore
+
+The agent publishes a complete image whose layer chain references the parent rootfs plus one new delta. The runtime pulls missing blobs and starts a fresh process. PVC data follows the storage lifecycle, not image revision history.
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"diagramPadding": 24}}}%%
+flowchart TB
+    subgraph Capture["Capture on the source node"]
+        Task["Workspace task"] -->|Freeze writes| Diff["Agent: consume rootfs diff"]
+        Diff --> Builder["Agent: OCI image builder"]
     end
-
-    APIServer <-->|Watch / Update Status| Reconciler
-    PodOrch -->|Create / Delete Pod & PVC| APIServer
-    RevMgr -->|DELETE expired manifests| Registry["OCI Registry (Harbor / registry:2)"]
-
-    subgraph Scheduler["K8s Scheduler & GPU Plugins"]
-        K8sSched["kube-scheduler + GPU Operator / HAMi / Volcano"]
+    Builder -->|Ensure parent blobs| Registry[("OCI registry")]
+    Builder -->|Publish delta and manifest| Registry
+    Registry -->|Record digest| Status["GPUWorkspace status"]
+    subgraph Restore["Restore on a compatible node"]
+        Runtime["containerd"] -->|Unpack image| Rootfs["Workspace rootfs"]
+        Rootfs --> Pod["New workspace process"]
     end
-    APIServer <-->|Bind Pod to Node| K8sSched
-
-    subgraph WorkerNode["Worker Node (DaemonSet + Runtime)"]
-        subgraph Agent["crema-agent (DaemonSet Pod)"]
-            GRPC["gRPC Server (CommitContainer)"]
-            DiffEngine["Snapshot & Diff Engine (zstd)"]
-            OCIBuilder["OCI Manifest Builder & Pusher"]
-            GRPC --> DiffEngine --> OCIBuilder
-        end
-
-        Kubelet["kubelet"]
-        Containerd["containerd (/run/containerd/containerd.sock)"]
-
-        subgraph WorkspacePod["Workspace Pod"]
-            Rootfs["OverlayFS Rootfs: lowerdir(Base + Deltas) + upperdir(Writable)"]
-            DataVol["PVC Mount (/workspace)"]
-        end
-
-        DiffEngine -->|"1. Task.Pause() -> diff.Compare() -> Task.Resume()"| Containerd
-        Containerd -->|Manage snapshots & cgroups| WorkspacePod
-        Kubelet -->|CRI Pull & Start Container| Containerd
-    end
-
-    Reconciler -->|"gRPC: CommitContainer(containerID, targetTag)"| GRPC
-    OCIBuilder -->|"2. HEAD base layers (skip) + PUT delta blob & manifest"| Registry
-    Kubelet -->|"3. Pull new image (only delta layer)"| Registry
-    DataVol <-->|Persistent Data| Storage["CSI / StorageClass (PVC)"]
+    Status -.->|Recreate after persistence| Runtime
+    Registry -->|Pull missing blobs| Runtime
+    PVC[("PVC data")] --- Pod
 ```
 
 ### Components
 1. **`crema-controller` (Deployment)**:
    - Watches `GPUWorkspace` and owned `Pod` / `PVC` resources.
-   - Uses a **Recreate-only** strategy for GPU scaling and rollbacks (avoiding double GPU allocation and `ReadWriteOnce` PVC mount deadlocks that `RollingUpdate` would cause).
+   - Uses a **Recreate-only** strategy: wait for the old Pod to terminate before creating its replacement. This avoids overlapping GPU allocations and reduces volume conflicts; detach/attach delays and PVC node topology still constrain scheduling.
    - Injects a soft node affinity (`preferredDuringSchedulingIgnoredDuringExecution`) toward the previous `status.nodeName` when recreating Pods so `kubelet` can reuse locally cached multi-GB CUDA base layers whenever the node has capacity.
    - Resolves the target node's `crema-agent` endpoint (via `crema-agent` Pod IP on `status.nodeName`) and invokes `CommitContainer` via gRPC.
    - Persists the resulting `SnapshotRecord` in `GPUWorkspace.status` **before** deleting the old Pod.
-   - Manages revision history and prunes expired OCI manifests directly via the OCI Registry HTTP API v2 (no separate S3 dependency).
+   - Manages revision retention through a registry-specific deletion policy. History pruning, manifest deletion, and physical blob garbage collection are distinct operations; see Section 7.
 2. **`crema-agent` (DaemonSet)**:
    - Stateless node-level executor mounting `/run/containerd/containerd.sock` (namespace `k8s.io`).
    - Exposes a gRPC server (`CommitContainer`, `Health`).
-   - Locates the target container ID, freezes its cgroup briefly during diff (`Task.Pause` → `diff.Compare` → `Task.Resume`, skipping `Pause`/`Resume` if the container is already `Exited`), compresses the delta with concurrent `zstd`, and pushes the new OCI image using `go-containerregistry` with `HEAD` blob deduplication.
+   - Validates workspace/Pod/container identity, freezes a running task, fully consumes the diff stream, and builds/pushes the image. Manual snapshots resume after capture; recreate operations keep writes quiesced until termination or a bounded failure timeout. An exited task is usable only while its snapshot still exists.
+   - Uses the parent config's ordered `rootfs.diff_ids` plus the new **uncompressed** delta DiffID, and the manifest's ordered layer digests plus the **compressed** delta digest. `zstd`/`gzip` media types must match the actual blob encoding; runtime support is an MVP verification item.
 
 ---
 
 ## 5. CRD Design (`crema.kubebottle.io/v1alpha1`)
 
+`GPUWorkspace` separates **how the Pod runs** (`spec.template`, following the LWS / AIBrix `PodTemplateSpec` pattern) from **how workspace rootfs state is saved, released, and restored**.
+
 ### `GPUWorkspaceSpec`
-- `image` (`string`, required): Base container image (e.g. `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel`).
-- `gpuCount` (`*int32`, `>= 0`, default `1`): Desired GPU count. `0` omits GPU resource requests/limits so the Pod can schedule on CPU-only nodes.
-- `gpuResourceName` (`string`, default `"nvidia.com/gpu"`): Extended resource name for GPU requests/limits.
-- `resources` (`corev1.ResourceRequirements`, optional): CPU and memory requests/limits.
-- `command` / `args` (`[]string`, optional): Container entrypoint override (defaults to a keep-alive shell/sleep if omitted).
-- `env` (`[]corev1.EnvVar`, optional): Environment variables.
-- `ports` (`[]corev1.ContainerPort`, optional): Exposed container ports.
-- `volumes` (`[]VolumeSpec`, optional): Persistent data volumes (PVC-backed, e.g. `/workspace`) independent of rootfs snapshots.
-- `paused` (`bool`, default `false`): When `true`, snapshots the running workspace (if any) and terminates the Pod to release compute/GPU resources.
-- `targetRevision` (`*int32`, optional): Declarative rollback target. When set to a past revision `k` in `status.snapshots`, the controller recreates the Pod from `snapshots[k].image` and updates `currentRevision`.
-- `registry` (`RegistrySpec`, required or cluster-default):
-  - `repository` (`string`): Target OCI repository (e.g. `registry.crema-system.svc:5000/workspaces`).
+- `template` (`corev1.PodTemplateSpec`, required): Pod template defining containers, GPU/CPU/memory `resources`, `env`, `ports`, `securityContext`, `imagePullSecrets`, `tolerations`, `affinity`, and `volumes`.
+  - Rootfs snapshotting and restoration target `template.spec.containers[0]` (native Kubernetes sidecars can use `initContainers` with `restartPolicy: Always`).
+  - `template.spec.containers[0].image` is the initial base image, resolved to a platform-specific digest (`status.baseImageDigest`) for revision `0`. MVP rejects base image changes after initialization.
+  - Any other template change (e.g. `nvidia.com/gpu` limits `0 ↔ 1`, CPU/memory, `env`, `securityContext`, scheduling) while `Running` triggers a snapshot-then-recreate cycle.
+- `volumeClaimTemplates` (`[]corev1.PersistentVolumeClaim`, optional): Follows the LWS / StatefulSet convention for operator-managed PVCs (e.g. specifying `storageClassName` and capacity). Created PVCs are named `<workspace>-<claimName>`, retained across `Paused` and `Recreate` transitions, and automatically bound to matching `volumeMounts`. Existing PVCs can still be referenced directly in `template.spec.volumes`.
+- `paused` (`bool`, default `false`): When `true`, snapshots the running workspace and deletes the Pod to release compute/GPU resources (while keeping PVCs). On snapshot failure, the Pod is **retained** and a `Condition` is surfaced rather than entering `Paused`.
+- `restore` (`*RestoreRequest`, optional): One-shot rollback request containing `requestID` (`string`, non-empty) and `revision` (`int64`, `>= 0`, where `0` is the base image). Processed once per `requestID` (`status.observedRestoreRequestID`). Rollback only restores rootfs, never PVC contents or process/GPU memory.
+- `registry` (`RegistrySpec`, required):
+  - `repository` (`string`, non-empty): Target OCI repository prefix (e.g. `registry.crema-system.svc:5000/workspaces`).
   - `secretRef` (`*corev1.LocalObjectReference`, optional): `kubernetes.io/dockerconfigjson` secret for registry auth.
-  - `insecure` (`bool`, default `false`): Allow HTTP / self-signed TLS for local dev registries.
+  - `plainHTTP` (`bool`, default `false`): Use plain HTTP (for local dev registries).
+  - `insecureSkipTLSVerify` (`bool`, default `false`): Skip TLS certificate verification.
 - `snapshotPolicy` (`SnapshotPolicy`, optional):
-  - `retentionLimit` (`int32`, default `5`): Max number of snapshot revisions to retain in `status.snapshots`.
+  - `retentionLimit` (`int32`, default `5`): Maximum number of retained snapshot records in `status.snapshots` (protected revisions such as `currentRevision` and active `operation.targetRevision` are never pruned; physical blob reclamation depends on OCI registry GC).
   - `compression` (`string`, enum `zstd` | `gzip`, default `zstd`).
-  - `snapshotTrigger` (`string`, optional): Changing this value (e.g. timestamp/UUID) triggers an on-demand snapshot without changing `gpuCount` or `paused`.
+  - `snapshotTrigger` (`string`, optional): Changing this value triggers an on-demand snapshot without recreating the Pod.
 
 ### `GPUWorkspaceStatus`
-- `phase` (`Phase`): `Pending` | `Running` | `Snapshotting` | `Paused` | `Scaling` | `Failed`
-- `conditions` (`[]metav1.Condition`): Standard K8s conditions (`Ready`, `Snapshotting`, `Degraded`).
+- `phase` (`Phase`): `Pending` | `Running` | `Snapshotting` | `Paused` | `Recreating` | `Failed`
+- `conditions` (`[]metav1.Condition`, `+listType=map`, `+listMapKey=type`): Standard K8s conditions (`Ready`, `SnapshotReady`, `TemplateValid`, `Degraded`).
 - `observedGeneration` (`int64`)
+- `baseImage` (`string`) & `baseImageDigest` (`string`): Resolved immutable image reference for revision `0`.
 - `currentImage` (`string`): Effective image currently running (or ready to resume from when `Paused`).
-- `currentRevision` (`int32`): Active revision number (`0` for initial base image).
-- `observedTargetRevision` (`*int32`, optional): Tracks the last processed `spec.targetRevision` to ensure rollback idempotency when new snapshots are subsequently created (`maxRevision + 1`).
-- `podName` (`string`), `nodeName` (`string`)
+- `currentRevision` (`int64`): Active revision number (`0` for initial base image).
+- `lastAllocatedRevision` (`int64`): Monotonic high-watermark allocation counter; rollback and history pruning never reuse revision numbers.
+- `appliedTemplateHash` (`string`): Hash of the last applied `spec.template` (excluding immutable base image), used to detect template changes.
+- `observedRestoreRequestID` (`string`): Tracks the last processed `spec.restore.requestID`.
 - `lastSnapshotTrigger` (`string`): Tracks processed manual trigger.
+- `podName` (`string`), `nodeName` (`string`)
+- `operation` (`*OperationStatus`, optional): Durable in-flight operation record, persisted before invoking `crema-agent`:
+  - `id` (`string`), `type` (`Snapshot` | `Recreate` | `Pause` | `Restore`), `stage` (`Committing` | `Committed` | `Recreating`)
+  - `sourcePodUID` (`string`), `containerID` (`string`), `nodeName` (`string`)
+  - `generation` (`int64`), `reason` (`string`), `targetRevision` (`*int64`)
+  - `committedImage` (`string`, optional), `quiescenceDeadline` (`metav1.Time`, optional)
 - `snapshots` (`[]SnapshotRecord`):
-  - `revision` (`int32`)
-  - `image` (`string`): Full immutable image reference (e.g. `repo/ns-name:rev-1@sha256:...`).
-  - `layerDigest` (`string`): Digest of the incremental delta layer.
-  - `layerSizeBytes` (`int64`): Compressed size of the delta layer.
-  - `reason` (`string`): `ScaleGPU` | `Pause` | `Manual`
-  - `createdAt` (`metav1.Time`)
+  - `revision` (`int64`), `parentRevision` (`*int64`, optional — tracks branch lineage after rollbacks)
+  - `image` (`string`), `layerDigest` (`string`), `layerSizeBytes` (`int64`)
+  - `reason` (`string`: `TemplateChange` | `Pause` | `Manual`), `createdAt` (`metav1.Time`)
 
 ---
 
@@ -187,15 +191,18 @@ flowchart TB
 stateDiagram-v2
     [*] --> Pending: Create GPUWorkspace
     Pending --> Running: Pod Ready (rev 0)
-    Running --> Snapshotting: gpuCount changed / paused=true / manual trigger
+    Running --> Snapshotting: template changed / paused=true / manual trigger
     Snapshotting --> Paused: paused=true (commit ok, Pod deleted)
-    Snapshotting --> Scaling: gpuCount changed (commit ok, Pod recreated)
+    Snapshotting --> Recreating: template changed (commit ok, Pod recreated)
     Snapshotting --> Running: manual trigger (commit ok)
-    Snapshotting --> Failed: commit error (retry with backoff)
-    Scaling --> Running: New Pod Ready (rev N)
-    Paused --> Running: paused=false (Pod recreated from currentImage)
-    Running --> Scaling: targetRevision changed (rollback, no new commit)
-    Paused --> Paused: targetRevision changed (update currentImage)
+    Snapshotting --> Failed: commit error (retain Pod, retry with backoff)
+    Recreating --> Running: Replacement Pod Ready
+    Paused --> Recreating: paused=false (recreate from currentImage)
+    Running --> Recreating: restore.requestID changed (rollback, no new commit)
+    Paused --> Paused: restore.requestID changed (update currentImage)
+    Pending --> Paused: paused=true (no Pod needed)
+    Failed --> Snapshotting: Retry capture on surviving source
+    Failed --> Recreating: Retry replacement from recorded image
 ```
 
 ### Incremental Commit & Pod Recreation Sequence
@@ -206,41 +213,58 @@ sequenceDiagram
     participant A as crema-agent (Node)
     participant D as containerd
     participant R as OCI Registry
-    participant K as API Server / kubelet
+    participant K as Kubernetes API
+    participant N as kubelet / containerd
 
     Note over C: Detects gpuCount: 0 -> 1 on Running Pod
-    C->>C: Set status.phase = Snapshotting
-    C->>A: gRPC CommitContainer(containerID, targetRepo, tag, compression=zstd)
-    A->>D: Task.Pause() (cgroup freeze for consistent diff)
-    A->>D: diff.Compare(parentSnapshot, activeSnapshot) -> delta tar
-    A->>D: Task.Resume()
-    A->>A: Compress delta tar with concurrent zstd & compute DiffID/Digest
-    A->>R: HEAD base layer digests (all hit -> skip upload)
-    A->>R: PUT delta layer blob + updated OCI Config & Manifest
-    R-->>A: 201 Created (manifestDigest)
-    A-->>C: CommitResponse(imageRef, layerDigest, layerSizeBytes)
-    C->>C: Append SnapshotRecord to status, update currentImage & currentRevision
-    C->>K: Delete old Pod (graceful termination)
-    C->>K: Create new Pod (image=imageRef, gpuCount=1)
-    K-->>C: New Pod Running & Ready -> status.phase = Running
+    C->>K: Persist operation ID, source UID, reserved revision
+    C->>A: CommitContainer(operation, source, deadline)
+    A->>D: Validate identity and pause task
+    A->>D: Open parent-to-active diff
+    A->>A: Consume full stream and compute DiffID / digest
+    Note over A,D: Recreate keeps writes frozen within deadline
+    A->>R: Ensure parent blobs in target repository
+    A->>R: Publish delta, config, then manifest
+    R-->>A: Immutable manifest digest
+    A-->>C: Image result and capture validity
+    C->>K: Persist image, revision, operation stage
+    K-->>C: Status update acknowledged
+    C->>A: Confirm source remains quiesced
+    A-->>C: Valid source identity and unexpired capture
+    C->>K: Delete source Pod with UID precondition
+    Note over A,N: Terminate without allowing further rootfs writes
+    K-->>C: Old Pod termination observed
+    C->>K: Create replacement using recorded digest
+    K->>N: Assigned replacement Pod
+    N->>R: Pull missing image blobs
+    N-->>C: Replacement Ready (observed via Pod status)
+    C->>K: Mark Running and clear operation
 ```
 
 ---
 
 ## 7. Key Engineering Details & Edge Cases
 
-1. **Snapshot Consistency (`Task.Pause` & `Paused`-first workflow)**:
-   - Diffing a live OverlayFS `UpperDir` while processes are writing can capture half-written package databases or truncated files.
-   - For MVP, `crema-agent` invokes `containerd`'s `Task.Pause()` (cgroup freezer) only for the duration of `diff.Compare`, then immediately calls `Task.Resume()` (skipping `Pause`/`Resume` if the container is already `Exited`). The container is never killed until the OCI push succeeds.
-   - Users can also set `spec.paused: true` first to snapshot and release GPUs cleanly before resizing `spec.gpuCount` and resuming (`paused: false`), matching the familiar "stop → resize → start" workflow without triggering an extra commit on resume. Post-MVP, `snapshotPolicy.quiesceMode` (`freeze` | `stop`) can be added if strict stop-before-diff is desired.
-2. **Crash Recovery & Idempotency**:
-   - `crema-controller` **must** persist `status.currentImage` and `status.snapshots` to the API Server before deleting the old Pod.
-   - If the controller crashes after `CommitContainer` succeeds and status is updated, the next reconcile sees the old Pod's image != `status.currentImage` and proceeds cleanly to recreate the Pod without re-committing.
-   - `CommitContainer` uses deterministic tags (e.g. `<ns>-<name>:rev-<N>`) and checks if the target revision already exists in `status.snapshots`.
-3. **Finalizer & Cleanup**:
-   - A finalizer (`crema.kubebottle.io/finalizer`) ensures owned Pods are cleaned up and (optionally) old registry tags are pruned on deletion, while user PVCs can follow standard `OwnerReference` or retention rules.
-4. **Node Agent Discovery**:
-   - `crema-controller` finds the `crema-agent` Pod on `status.nodeName` using a label selector (`app.kubernetes.io/name=crema-agent`) and field selector (`spec.nodeName=<node>`), connecting directly to `<agentPodIP>:9090`. No static node IP mapping required.
+1. **Capture consistency and bounded downtime**:
+   - Opening `diff.Compare` is not enough: consume the entire returned stream while the source remains stable. Freeze provides a filesystem capture, not an application transaction boundary; users should quiesce package managers, databases, and training jobs first.
+   - For a manual snapshot, resume after the full delta is captured into an immutable local artifact; compression/push can finish afterward. For pause/resize, do not resume writes before terminating the source: otherwise changes made during push would silently disappear in the replacement.
+   - Frozen tasks cannot run graceful shutdown handlers. The proposed MVP therefore requires an explicitly documented bounded termination path for a frozen source; application-level graceful shutdown is not promised. A deadline watchdog resumes surviving tasks on failure, invalidates the capture for replacement, and requires recapture. Watchdog behavior across agent restarts is a release gate, not an assumed property.
+   - Delete only after publication, acknowledged status persistence, and valid quiescence. The deadline/termination race requires node-local serialization: termination and watchdog resume must not both succeed for the same capture. The exact RPC and kubelet interaction must be proven in integration tests before shipping.
+   - `paused: true` before resizing remains the supported stop → resize → start workflow. If the source node/snapshot is lost, restore only the last published revision and report that unsaved changes are unrecoverable.
+2. **Operation identity and crash recovery**:
+   - Persist an operation record and reserve `nextRevision` before the RPC. Serialize mutations per workspace/source container; use Kubernetes optimistic concurrency and an agent-side operation lock rather than treating `phase` as a lock.
+   - Use workspace UID plus operation ID for registry publication identity, not just namespace/name/revision. Retries reuse the same publication result only while source identity and capture validity still match. A new object with the same name must not inherit another workspace's revisions.
+   - If publication succeeds but the status update fails, retry by operation identity and recover the published digest. If the source has resumed, retain the image only as a historical snapshot and recapture before replacement. Comparing Pod image strings alone cannot establish capture validity.
+   - If the old Pod is gone and the result is durably recorded, retry creation from that digest without another commit. A scheduling failure must preserve the recorded image. Apply later spec generations in the next operation rather than changing an in-flight operation's source or revision.
+3. **Retention, registry deletion, and finalizers**:
+   - Protect revision `0`, the active image, a requested rollback image, and every in-flight operation result. `retentionLimit` bounds eligible history, not protected references. Allocate new revisions from the monotonic counter, never `max(retained revisions) + 1`.
+   - Removing a status record does not free registry storage. Manifest deletion by digest may affect multiple tags; Harbor tag/artifact APIs and distribution manifest deletion need distinct adapters. Do not delete a digest still referenced by a protected revision or another workspace.
+   - Let the registry's own GC reclaim unreferenced blobs. Newer images still reference older delta layers even after old manifests are removed. Default to history-only pruning until reference-safe registry deletion is tested.
+   - The proposed `crema.kubebottle.io/finalizer` cleans up owned Pods and operation state. Preserve externally supplied PVCs by default; deletion of crema-created PVCs needs an explicit retention policy. Registry outages should not indefinitely block object deletion under the default history-only policy.
+4. **Trust boundaries and node discovery**:
+   - Find the agent Pod with `app.kubernetes.io/name=crema-agent` on the source Pod's `spec.nodeName`; require a Ready endpoint and validate the Pod UID/container ID immediately before capture. A generic load-balanced Service must not route a commit to a different node.
+   - Access to the containerd socket is node-privileged. Require authenticated controller-to-agent RPC, namespace/workspace authorization, least-privilege RBAC, and deny arbitrary container commits. NetworkPolicy complements authentication but does not replace it.
+   - Keep registry credentials out of CRD status and logs. Configure both agent push credentials and replacement Pod `imagePullSecrets`; configure node-runtime registry connectivity/trust independently. Rootfs images can contain user secrets, so repository access control is part of the security model.
 
 ---
 
@@ -250,8 +274,8 @@ To keep the MVP fast, verifiable, and free of physical GPU hardware dependencies
 
 1. **Local Cluster Setup**:
    - `kind` cluster (uses `containerd` as CRI).
-   - In-cluster OCI Registry (`registry:2` on `registry.crema-system.svc:5000`, configured in `kind` `containerdConfigPatches` for HTTP pull).
-   - Patch `kind` worker node `.status.capacity["nvidia.com/gpu"] = "2"` (standard K8s extended resource simulation) so the K8s scheduler enforces GPU capacity and Pod scheduling `0 ↔ 1 ↔ 2` is genuinely exercised.
+   - OCI registry (`registry:2`) on an address reachable from both agent Pods and kind node containers. Do not assume a cluster Service DNS name resolves in the node runtime; verify push and pull separately and configure HTTP only for the local test environment.
+   - A mock device plugin advertising a test extended resource, configured through `gpuResourceName`, to exercise `0 ↔ 1 ↔ 2` scheduling and kubelet allocation. Patching Node capacity alone does not validate device-plugin admission or actual GPU execution. Real NVIDIA/CUDA verification is a separate hardware test.
 2. **End-to-End Test Scenario**:
    - **Step 1 (Create)**: Apply `GPUWorkspace` (`image: ubuntu:22.04`, `gpuCount: 0`). Wait for `phase: Running`, `currentRevision: 0`.
    - **Step 2 (Mutate Rootfs)**: `kubectl exec` into Pod:
@@ -260,10 +284,17 @@ To keep the MVP fast, verifiable, and free of physical GPU hardware dependencies
      - Delete an existing file from the base image (e.g., `/usr/share/doc/...` or a pre-created test file in a custom base image) to verify whiteout `.wh.*` handling.
    - **Step 3 (Scale GPU `0 → 1`)**: Patch `spec.gpuCount: 1`. Verify:
      - Phase transitions `Running → Snapshotting → Scaling → Running`.
-     - New Pod requests `nvidia.com/gpu: 1` and runs on the patched node.
+     - New Pod requests one unit of the configured test resource and runs on a node advertising it; the old Pod is gone before the replacement is created.
      - `jq --version`, `/root/.bashrc`, `/etc/crema-test` are all intact, and the deleted file remains deleted.
-   - **Step 4 (Pause & Resume)**: Patch `spec.paused: true` → verify `phase: Paused` and Pod deleted (`nvidia.com/gpu` released). Patch `spec.paused: false` → verify Pod resumes at `rev-2` with all changes intact.
+   - **Step 4 (Pause & Resume)**: Patch `spec.paused: true` → verify `phase: Paused` and Pod deleted (test resource released). Patch `spec.paused: false` → verify Pod resumes at `rev-2` with all changes intact.
    - **Step 5 (Rollback)**: Set `spec.targetRevision: 1` → verify Pod recreates with `rev-1` image.
+3. **Safety and Compatibility Gates**:
+   - Crash the controller before publication, after publication but before status persistence, and after old Pod deletion. Verify operation retries do not reuse revision IDs or delete an unrecorded source.
+   - Run a continuous rootfs writer during resize. Verify writes cannot resume between the accepted capture and source termination; if the deadline expires, the Pod survives and the operation recaptures. Restart the agent during a freeze and verify the watchdog recovery path.
+   - Inject registry authentication failures, missing base blobs, status conflicts, and scheduling failures. Verify first-commit base-layer copy and later deduplication; preserve the last recorded image on replacement failure.
+   - Verify actual runtime support for both `zstd` and `gzip`, whiteout and opaque-directory round trips, DiffID/digest correctness, and new-process startup from each image.
+   - Verify manual snapshots do not recreate the Pod; rollback does not revert PVC data; unknown revisions are rejected; revision IDs remain monotonic after rollback and pruning.
+   - Verify PVC detach/attach and cross-node restore on a two-worker cluster. Test agent authentication, wrong-node/wrong-UID rejection, and reference-safe retention independently of registry blob GC.
 
 ---
 
@@ -273,12 +304,14 @@ To keep the MVP fast, verifiable, and free of physical GPU hardware dependencies
    - Finalize `docs/design.md` (this document).
    - Initialize Go module (`github.com/kubebottle/crema`), Kubebuilder / `controller-runtime` project layout, and `proto/agent.proto`.
 2. **Phase 2 — `crema-agent` Core**:
-   - Implement `containerd` client (`k8s.io` namespace): container lookup, `Task.Pause`/`Resume`, `diff.Compare` / `rootfs.CreateDiff`.
+   - Implement `containerd` client (`k8s.io` namespace): identity validation, full-stream diff capture, per-container operation locking, and bounded freeze/recovery across agent restarts.
    - Implement concurrent `zstd` compression + OCI manifest/config assembly + registry push (`go-containerregistry` or `oras-go`) with blob `HEAD` deduplication.
-   - Unit & integration tests against local `containerd` / registry.
+   - Unit & integration tests against local `containerd` / registry, including parent-blob availability, compression support, and the freeze-to-termination protocol.
 3. **Phase 3 — `crema-controller` & CRD**:
-   - Implement `GPUWorkspace` CRD + `Reconcile` state machine + gRPC client to `crema-agent` + revision retention GC.
+   - Implement `GPUWorkspace` CRD + durable operation state machine + authenticated agent RPC + protected revision retention (history-only by default).
    - Envtest unit tests for state transitions.
 4. **Phase 4 — `kind` E2E & Documentation**:
-   - Automated `make e2e-kind` script spinning up `kind` + local registry + simulated GPU capacity and running the 5-step E2E test.
+   - Add a future `make e2e-kind` target for `kind` + local registry + mock device plugin, covering the lifecycle scenario and failure gates above. This target does not exist yet.
    - Update `README.md` with architecture diagram, quickstart, and demo output.
+
+The implementation should preserve three boundaries: **Kubernetes records intent and durable results; agents capture one identified source; registries and PVCs store different kinds of state.** A successful upload is not permission to delete a Pod, a filesystem snapshot is not a process checkpoint, and an image rollback is not a data rollback.

@@ -25,45 +25,15 @@ Inspired by [gpu-docker-api](https://github.com/mayooot/gpu-docker-api), redesig
 
 > See [docs/design.md](docs/design.md) for the full architecture, CRD specification, and state machine details.
 
-```mermaid
-%%{init: {'themeVariables': {'fontFamily': 'arial, sans-serif', 'fontSize': '13px'}}}%%
-flowchart TB
-    User("User / kubectl") -->|"Apply CRD"| API["K8s API Server"]
+![crema architecture: the controller reconciles Kubernetes resources, the node agent commits rootfs changes to an OCI registry, and containerd restores images while PVC data remains separate.](assets/architecture.svg)
 
-    subgraph CP["Control Plane · crema-controller"]
-        direction LR
-        Reconciler["Reconciler"] --> PodOrch["Pod Orchestrator<br/>Recreate + Affinity"]
-        Reconciler --> GC["Revision GC"]
-    end
+The controller owns **desired state**; the node agent captures **filesystem state**. Before replacing a workspace Pod, crema publishes an immutable image and records its digest in Kubernetes. The replacement starts through the normal kubelet/containerd path, with a new GPU allocation and the saved rootfs.
 
-    API <-->|"Watch"| Reconciler
-    PodOrch -->|"Pod / PVC"| API
-    GC -->|"GC tags"| Registry[("OCI Registry<br/>Harbor / registry:2")]
+- **Rootfs revisions** live in OCI images. The first commit may copy missing base layers into the workspace repository; later commits reuse blobs already present there.
+- **Persistent data** stays on PVCs and is not included in rootfs snapshots or rolled back with an image revision.
+- **Pause/resume restarts processes**; it does not restore RAM, running jobs, or CUDA contexts. Recreate operations require a bounded write-quiescence window.
 
-    subgraph Node["Worker Node · DaemonSet & Runtime"]
-        direction TB
-        Agent["crema-agent<br/>Pause · Diff · zstd · Push"]
-        Containerd["containerd<br/>k8s.io · OverlayFS"]
-        Pod["Workspace Pod<br/>Rootfs + PVC"]
-
-        Agent -->|"Pause / Diff"| Containerd
-        Containerd --> Pod
-    end
-
-    Reconciler -->|"gRPC Commit"| Agent
-    Agent -->|"Push delta"| Registry
-    Containerd -->|"Pull delta"| Registry
-
-    classDef control fill:#eef4ff,stroke:#4a7bd0,stroke-width:1.5px,color:#1e293b
-    classDef agent fill:#fffbeb,stroke:#d97706,stroke-width:1.5px,color:#451a03
-    classDef infra fill:#f8fafc,stroke:#64748b,stroke-width:1.5px,color:#0f172a
-    classDef registry fill:#f0fdf4,stroke:#16a34a,stroke-width:1.5px,color:#14532d
-
-    class Reconciler,PodOrch,GC control
-    class Agent agent
-    class API,Containerd,Pod infra
-    class Registry registry
-```
+The overview intentionally omits scheduling and revision GC internals; see the [control and data flow diagrams](docs/design.md#4-system-architecture). The checked-in SVG avoids GitHub's live Mermaid label rendering; its editable source is [assets/architecture.mmd](assets/architecture.mmd).
 
 ## Status
 

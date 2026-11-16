@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 420" width="100%" role="img" aria-labelledby="title desc">
+  <title id="title">crema architecture</title>
+  <desc id="desc">User submits desired state to the Kubernetes API, crema-controller reconciles state and sends commit requests to crema-agent on the worker node, crema-agent freezes and diffs containerd rootfs and publishes revisions to an OCI registry, containerd restores images into a Workspace Pod, and PVC data mounts separately.</desc>
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .group { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; stroke-dasharray: 6 4; }
+      .group-label { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; fill: #64748b; letter-spacing: 0.03em; }
+      .node-infra { fill: #f8fafc; stroke: #64748b; stroke-width: 1.5; }
+      .node-control { fill: #eef4ff; stroke: #4a7bd0; stroke-width: 1.5; }
+      .node-agent { fill: #fffbeb; stroke: #d97706; stroke-width: 1.5; }
+      .node-storage { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.5; }
+      .label-infra { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #0f172a; text-anchor: middle; dominant-baseline: central; }
+      .label-control { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #1e293b; text-anchor: middle; dominant-baseline: central; }
+      .label-agent { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #451a03; text-anchor: middle; dominant-baseline: central; }
+      .label-storage { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #14532d; text-anchor: middle; dominant-baseline: central; }
+      .edge { fill: none; stroke: #64748b; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+      .edge-pill { fill: #ffffff; }
+      .edge-text { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12.5px; font-weight: 500; fill: #475569; text-anchor: middle; dominant-baseline: central; }
+    </style>
+    <marker id="arrow-end" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.2 L 9 5 L 0 8.8 z" fill="#64748b" />
+    </marker>
+    <marker id="arrow-start" viewBox="0 0 10 10" refX="1.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 10 1.2 L 1 5 L 10 8.8 z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="840" height="420" rx="12" />
+
+  <!-- Worker Node boundary -->
+  <rect class="group" x="20" y="136" width="800" height="114" rx="12" />
+  <text class="group-label" x="36" y="156">WORKER NODE</text>
+
+  <!-- Edges -->
+  <!-- User -> Kubernetes API -->
+  <path class="edge" d="M 180 52 L 311 52" marker-end="url(#arrow-end)" />
+  <rect class="edge-pill" x="199" y="40" width="94" height="24" rx="4" />
+  <text class="edge-text" x="246" y="52">Desired state</text>
+
+  <!-- Kubernetes API <-> crema-controller -->
+  <path class="edge" d="M 481 52 L 641 52" marker-start="url(#arrow-start)" marker-end="url(#arrow-end)" />
+  <rect class="edge-pill" x="505" y="40" width="112" height="24" rx="4" />
+  <text class="edge-text" x="561" y="52">Reconcile / status</text>
+
+  <!-- crema-controller -> crema-agent -->
+  <path class="edge" d="M 728 76 L 728 171" marker-end="url(#arrow-end)" />
+  <rect class="edge-pill" x="676" y="103" width="104" height="22" rx="4" />
+  <text class="edge-text" x="728" y="114">Commit request</text>
+
+  <!-- crema-agent -> containerd / rootfs -->
+  <path class="edge" d="M 646 202 L 481 202" marker-end="url(#arrow-end)" />
+  <rect x="520" y="190" width="86" height="24" rx="4" fill="#f8fafc" />
+  <text class="edge-text" x="563" y="202">Freeze / diff</text>
+
+  <!-- containerd / rootfs -> Workspace Pod -->
+  <path class="edge" d="M 316 202 L 191 202" marker-end="url(#arrow-end)" />
+  <rect x="217" y="190" width="72" height="24" rx="4" fill="#f8fafc" />
+  <text class="edge-text" x="253" y="202">Start Pod</text>
+
+  <!-- PVC data to Workspace Pod -->
+  <path class="edge" d="M 111 316 L 111 227" />
+  <rect class="edge-pill" x="70" y="268" width="82" height="22" rx="4" />
+  <text class="edge-text" x="111" y="279">Mount data</text>
+
+  <!-- crema-agent -> OCI registry -->
+  <path class="edge" d="M 728 227 L 728 342 Q 728 354 716 354 L 651 354" marker-end="url(#arrow-end)" />
+  <rect class="edge-pill" x="673" y="274" width="110" height="22" rx="4" />
+  <text class="edge-text" x="728" y="285">Publish revision</text>
+
+  <!-- OCI registry -> containerd / rootfs -->
+  <path class="edge" d="M 494 354 L 408 354 Q 396 354 396 342 L 396 232" marker-end="url(#arrow-end)" />
+  <rect class="edge-pill" x="348" y="274" width="96" height="22" rx="4" />
+  <text class="edge-text" x="396" y="285">Restore image</text>
+
+  <!-- Nodes -->
+  <!-- User / kubectl -->
+  <rect class="node-infra" x="30" y="28" width="150" height="48" rx="24" />
+  <text class="label-infra" x="105" y="52">User / kubectl</text>
+
+  <!-- Kubernetes API -->
+  <rect class="node-infra" x="316" y="28" width="160" height="48" rx="8" />
+  <text class="label-infra" x="396" y="52">Kubernetes API</text>
+
+  <!-- crema-controller -->
+  <rect class="node-control" x="646" y="28" width="164" height="48" rx="8" />
+  <text class="label-control" x="728" y="52">crema-controller</text>
+
+  <!-- Workspace Pod -->
+  <rect class="node-infra" x="36" y="177" width="150" height="50" rx="8" />
+  <text class="label-infra" x="111" y="202">Workspace Pod</text>
+
+  <!-- containerd / rootfs -->
+  <rect class="node-infra" x="316" y="177" width="160" height="50" rx="8" />
+  <text class="label-infra" x="396" y="202">containerd / rootfs</text>
+
+  <!-- crema-agent -->
+  <rect class="node-agent" x="646" y="177" width="164" height="50" rx="8" />
+  <text class="label-agent" x="728" y="202">crema-agent</text>
+
+  <!-- PVC data cylinder -->
+  <g transform="translate(111, 354)">
+    <path class="node-storage" d="M -70 -26 a 70 12 0 0 0 140 0 a 70 12 0 0 0 -140 0 l 0 52 a 70 12 0 0 0 140 0 l 0 -52" />
+    <path class="node-storage" d="M -70 -26 a 70 12 0 0 0 140 0" fill="none" />
+    <text class="label-storage" x="0" y="6">PVC data</text>
+  </g>
+
+  <!-- OCI registry cylinder -->
+  <g transform="translate(570, 354)">
+    <path class="node-storage" d="M -76 -26 a 76 12 0 0 0 152 0 a 76 12 0 0 0 -152 0 l 0 52 a 76 12 0 0 0 152 0 l 0 -52" />
+    <path class="node-storage" d="M -76 -26 a 76 12 0 0 0 152 0" fill="none" />
+    <text class="label-storage" x="0" y="6">OCI registry</text>
+  </g>
+</svg>
