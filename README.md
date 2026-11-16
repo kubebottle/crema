@@ -27,31 +27,31 @@ Inspired by [gpu-docker-api](https://github.com/mayooot/gpu-docker-api), redesig
 
 ```mermaid
 flowchart TB
-    User(["User / kubectl"]) -->|"Apply GPUWorkspace"| API["Kubernetes API Server"]
+    User("User / kubectl") -->|"Apply CRD"| API["K8s API Server"]
 
     subgraph CP["Control Plane · crema-controller"]
         direction LR
-        Reconciler["Reconciler & State Machine"] --> PodOrch["Pod / PVC Orchestrator\n(Recreate + Soft Affinity)"]
-        Reconciler --> GC["Revision History & GC"]
+        Reconciler["Reconciler"] --> PodOrch["Pod Orchestrator<br/>Recreate + Affinity"]
+        Reconciler --> GC["Revision GC"]
     end
 
     API <-->|"Watch / Status"| Reconciler
-    PodOrch -->|"Create / Delete Pod & PVC"| API
-    GC -->|"Delete expired manifests"| Registry[("OCI Registry\nHarbor / registry:2")]
+    PodOrch -->|"Pod / PVC"| API
+    GC -->|"Delete old tags"| Registry[("OCI Registry<br/>Harbor / registry:2")]
 
     subgraph Node["Worker Node · DaemonSet & Runtime"]
         direction TB
-        Agent["crema-agent (gRPC)\nPause -> Diff -> zstd -> OCI Push"]
-        Containerd["containerd (k8s.io)\nOverlayFS lowerdir + upperdir"]
-        Pod["Workspace Pod\nRootfs + PVC (/workspace)"]
+        Agent["crema-agent<br/>Pause · Diff · zstd · Push"]
+        Containerd["containerd (k8s.io)<br/>OverlayFS"]
+        Pod["Workspace Pod<br/>Rootfs + PVC"]
 
-        Agent -->|"Task.Pause / diff.Compare / Resume"| Containerd
+        Agent -->|"Pause / Diff / Resume"| Containerd
         Containerd --> Pod
     end
 
-    Reconciler -->|"gRPC CommitContainer"| Agent
-    Agent -->|"HEAD base (skip) + PUT delta layer"| Registry
-    Containerd -->|"Pull committed image (delta only)"| Registry
+    Reconciler -->|"gRPC Commit"| Agent
+    Agent -->|"HEAD skip + PUT delta"| Registry
+    Containerd -->|"Pull delta layer"| Registry
 
     classDef control fill:#eef4ff,stroke:#4a7bd0,stroke-width:1.5px,color:#1e293b
     classDef agent fill:#fffbeb,stroke:#d97706,stroke-width:1.5px,color:#451a03
