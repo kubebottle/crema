@@ -26,6 +26,7 @@ Inspired by [gpu-docker-api](https://github.com/mayooot/gpu-docker-api), redesig
 > See [docs/design.md](docs/design.md) for the full architecture, CRD specification, and state machine details.
 
 ```mermaid
+%%{init: {'themeVariables': {'fontFamily': 'arial, sans-serif', 'fontSize': '13px'}}}%%
 flowchart TB
     User("User / kubectl") -->|"Apply CRD"| API["K8s API Server"]
 
@@ -35,23 +36,23 @@ flowchart TB
         Reconciler --> GC["Revision GC"]
     end
 
-    API <-->|"Watch / Status"| Reconciler
+    API <-->|"Watch"| Reconciler
     PodOrch -->|"Pod / PVC"| API
-    GC -->|"Delete old tags"| Registry[("OCI Registry<br/>Harbor / registry:2")]
+    GC -->|"GC tags"| Registry[("OCI Registry<br/>Harbor / registry:2")]
 
     subgraph Node["Worker Node · DaemonSet & Runtime"]
         direction TB
         Agent["crema-agent<br/>Pause · Diff · zstd · Push"]
-        Containerd["containerd (k8s.io)<br/>OverlayFS"]
+        Containerd["containerd<br/>k8s.io · OverlayFS"]
         Pod["Workspace Pod<br/>Rootfs + PVC"]
 
-        Agent -->|"Pause / Diff / Resume"| Containerd
+        Agent -->|"Pause / Diff"| Containerd
         Containerd --> Pod
     end
 
     Reconciler -->|"gRPC Commit"| Agent
-    Agent -->|"HEAD skip + PUT delta"| Registry
-    Containerd -->|"Pull delta layer"| Registry
+    Agent -->|"Push delta"| Registry
+    Containerd -->|"Pull delta"| Registry
 
     classDef control fill:#eef4ff,stroke:#4a7bd0,stroke-width:1.5px,color:#1e293b
     classDef agent fill:#fffbeb,stroke:#d97706,stroke-width:1.5px,color:#451a03
