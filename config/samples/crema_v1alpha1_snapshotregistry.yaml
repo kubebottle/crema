@@ -1,0 +1,7 @@
+apiVersion: crema.kubebottle.io/v1alpha1
+kind: SnapshotRegistry
+metadata:
+  name: default
+spec:
+  repository: registry.crema-system.svc:5000/workspaces
+  plainHTTP: true

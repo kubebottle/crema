@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- crema_v1alpha1_snapshotregistry.yaml
+- crema_v1alpha1_gpuworkspace.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,35 @@
+apiVersion: crema.kubebottle.io/v1alpha1
+kind: GPUWorkspace
+metadata:
+  labels:
+    app.kubernetes.io/name: crema
+    app.kubernetes.io/managed-by: kustomize
+  name: gpuworkspace-sample
+spec:
+  paused: false
+  registryRef:
+    name: default
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 50Gi
+  template:
+    spec:
+      containers:
+        - name: workspace
+          image: pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /workspace
