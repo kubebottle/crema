@@ -1,5 +1,6 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+AGENT_IMG ?= crema-agent:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -94,6 +95,18 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
+
+.PHONY: proto
+proto: ## Generate Go gRPC code from proto/agent.proto.
+	protoc --go_out=. --go_opt=module=github.com/kubebottle/crema --go-grpc_out=. --go-grpc_opt=module=github.com/kubebottle/crema proto/agent.proto
+
+.PHONY: build-agent
+build-agent: fmt vet ## Build crema-agent binary.
+	go build -o bin/crema-agent cmd/agent/main.go
+
+.PHONY: docker-build-agent
+docker-build-agent: ## Build docker image for crema-agent.
+	$(CONTAINER_TOOL) build -f Dockerfile.agent -t ${AGENT_IMG} .
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

@@ -22,56 +22,36 @@ import (
 )
 
 // Phase represents the lifecycle phase of a GPUWorkspace.
-// +kubebuilder:validation:Enum=Pending;Running;Snapshotting;Paused;Recreating;Failed
+// +kubebuilder:validation:Enum=Pending;Running;Snapshotting;Suspended;Recreating;Failed
 type Phase string
 
 const (
 	PhasePending      Phase = "Pending"
 	PhaseRunning      Phase = "Running"
 	PhaseSnapshotting Phase = "Snapshotting"
-	PhasePaused       Phase = "Paused"
+	PhaseSuspended    Phase = "Suspended"
 	PhaseRecreating   Phase = "Recreating"
 	PhaseFailed       Phase = "Failed"
 )
 
-// SnapshotPolicy configures how workspace rootfs deltas are captured and retained.
-type SnapshotPolicy struct {
-	// RetentionLimit is the maximum number of snapshot records retained in status.
-	// Protected revisions (such as currentRevision and active operation target) are never pruned.
-	// Underlying blob reclamation depends on the OCI registry's GC policy.
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=5
-	// +optional
-	RetentionLimit int32 `json:"retentionLimit,omitempty"`
-
-	// Compression specifies the OCI delta layer compression algorithm.
-	// +kubebuilder:validation:Enum=zstd;gzip
-	// +kubebuilder:default=zstd
-	// +optional
-	Compression string `json:"compression,omitempty"`
-
-	// SnapshotTrigger triggers an on-demand snapshot whenever its value changes.
-	// +optional
-	SnapshotTrigger string `json:"snapshotTrigger,omitempty"`
-
-	// Message attaches an optional human-readable note to the next snapshot.
-	// +optional
-	Message string `json:"message,omitempty"`
-}
-
-// RestoreRequest represents a one-shot request to roll back the workspace rootfs
-// to a specific revision. Rollback only restores the container rootfs; it does
-// not revert PVC contents, running processes, or GPU memory, and keeps the
-// current spec.template compute configuration.
-type RestoreRequest struct {
-	// RequestID uniquely identifies this restore operation (e.g. UUID or timestamp).
+// VolumeClaimMetadata defines metadata for an operator-managed PVC template.
+type VolumeClaimMetadata struct {
+	// Name of the volume claim template; the created PVC is named <workspace>-<name>.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
-	RequestID string `json:"requestID"`
+	Name string `json:"name"`
 
-	// Revision is the target snapshot revision (0 = initial base image).
-	// +kubebuilder:validation:Minimum=0
-	Revision int64 `json:"revision"`
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+// VolumeClaimTemplate defines a PVC created and retained by the workspace lifecycle.
+type VolumeClaimTemplate struct {
+	Metadata VolumeClaimMetadata              `json:"metadata"`
+	Spec     corev1.PersistentVolumeClaimSpec `json:"spec"`
 }
 
 // GPUWorkspaceSpec defines the desired state of GPUWorkspace.
@@ -84,75 +64,34 @@ type GPUWorkspaceSpec struct {
 	// VolumeClaimTemplates optionally defines PVCs created and retained by the
 	// workspace lifecycle (following StatefulSet / LWS conventions).
 	// +optional
-	VolumeClaimTemplates []corev1.PersistentVolumeClaim `json:"volumeClaimTemplates,omitempty"`
+	VolumeClaimTemplates []VolumeClaimTemplate `json:"volumeClaimTemplates,omitempty"`
 
-	// Paused requests a snapshot-safe release of the workspace Pod to free GPUs and compute.
-	// On snapshot failure, the Pod is retained rather than entering Paused.
+	// Suspend requests a snapshot-safe release of the workspace Pod to free GPUs and compute.
+	// On snapshot failure, the Pod is retained rather than entering Suspended.
 	// +kubebuilder:default=false
 	// +optional
-	Paused bool `json:"paused,omitempty"`
+	Suspend bool `json:"suspend,omitempty"`
 
 	// RegistryRef references a cluster-scoped SnapshotRegistry by name.
 	// Defaults to "default" when omitted.
 	// +optional
 	RegistryRef *corev1.LocalObjectReference `json:"registryRef,omitempty"`
-
-	// SnapshotPolicy configures snapshot compression, retention, and manual triggers.
-	// +optional
-	SnapshotPolicy SnapshotPolicy `json:"snapshotPolicy,omitempty"`
-
-	// Restore requests a one-shot rollback of the workspace rootfs to a prior revision.
-	// +optional
-	Restore *RestoreRequest `json:"restore,omitempty"`
 }
 
-// OperationStatus persists an in-flight snapshot/recreate/restore operation before
+// OperationStatus persists an in-flight snapshot/recreate/suspend operation before
 // mutating external state (agent commit or Pod deletion), enabling crash-safe retries.
 type OperationStatus struct {
 	ID                 string       `json:"id"`
-	Type               string       `json:"type"`  // Snapshot | Recreate | Pause | Restore
+	Type               string       `json:"type"`  // Recreate | Suspend
 	Stage              string       `json:"stage"` // Committing | Committed | Recreating
 	SourcePodUID       string       `json:"sourcePodUID,omitempty"`
 	ContainerID        string       `json:"containerID,omitempty"`
 	NodeName           string       `json:"nodeName,omitempty"`
 	Generation         int64        `json:"generation,omitempty"`
 	Reason             string       `json:"reason,omitempty"`
-	TargetRevision     *int64       `json:"targetRevision,omitempty"`
+	TargetSeq          int64        `json:"targetSeq,omitempty"`
 	CommittedImage     string       `json:"committedImage,omitempty"`
 	QuiescenceDeadline *metav1.Time `json:"quiescenceDeadline,omitempty"`
-}
-
-// SnapshotRecord records an immutable OCI snapshot revision of the workspace rootfs.
-type SnapshotRecord struct {
-	// Revision is the monotonically allocated snapshot number (1, 2, ...).
-	Revision int64 `json:"revision"`
-
-	// ParentRevision records the revision from which this delta branched (0 or nil = base image).
-	// +optional
-	ParentRevision *int64 `json:"parentRevision,omitempty"`
-
-	// Image is the immutable OCI image reference (repo/ns-name:rev-N@sha256:...).
-	Image string `json:"image"`
-
-	// LayerDigest is the digest of the incremental delta layer produced in this revision.
-	LayerDigest string `json:"layerDigest"`
-
-	// LayerSizeBytes is the compressed size of the incremental delta layer in bytes.
-	LayerSizeBytes int64 `json:"layerSizeBytes"`
-
-	// Reason describes what triggered this snapshot (e.g. TemplateChange, Pause, Manual).
-	Reason string `json:"reason"`
-
-	// Summary is a compact diff summary extracted from the delta tar headers.
-	// +optional
-	Summary string `json:"summary,omitempty"`
-
-	// Message is an optional user-provided note for this snapshot.
-	// +optional
-	Message string `json:"message,omitempty"`
-
-	// CreatedAt is the timestamp when the snapshot was committed.
-	CreatedAt metav1.Time `json:"createdAt"`
 }
 
 // GPUWorkspaceStatus defines the observed state of GPUWorkspace.
@@ -171,26 +110,17 @@ type GPUWorkspaceStatus struct {
 	// BaseImage is the initial base image recorded from spec.template.spec.containers[0].image.
 	BaseImage string `json:"baseImage,omitempty"`
 
-	// BaseImageDigest is the resolved immutable reference for revision 0.
+	// BaseImageDigest is the resolved immutable reference for the initial base image.
 	BaseImageDigest string `json:"baseImageDigest,omitempty"`
 
-	// CurrentImage is the active OCI image reference (base image at rev 0, or a snapshot).
+	// CurrentImage is the active immutable OCI image reference (base image or latest snapshot).
 	CurrentImage string `json:"currentImage,omitempty"`
 
-	// CurrentRevision is the currently active revision number (0 = base image).
-	CurrentRevision int64 `json:"currentRevision,omitempty"`
-
-	// LastAllocatedRevision is the monotonic high-watermark counter for snapshot revisions.
-	LastAllocatedRevision int64 `json:"lastAllocatedRevision,omitempty"`
+	// SnapshotSeq is a monotonic counter used to generate unique OCI tags (rev-1, rev-2, ...).
+	SnapshotSeq int64 `json:"snapshotSeq,omitempty"`
 
 	// AppliedTemplateHash is the hash of spec.template currently running or last applied.
 	AppliedTemplateHash string `json:"appliedTemplateHash,omitempty"`
-
-	// ObservedRestoreRequestID tracks the last processed spec.restore.requestID.
-	ObservedRestoreRequestID string `json:"observedRestoreRequestID,omitempty"`
-
-	// LastSnapshotTrigger tracks the last processed spec.snapshotPolicy.snapshotTrigger.
-	LastSnapshotTrigger string `json:"lastSnapshotTrigger,omitempty"`
 
 	// PodName is the name of the currently active workspace Pod.
 	PodName string `json:"podName,omitempty"`
@@ -198,19 +128,16 @@ type GPUWorkspaceStatus struct {
 	// NodeName is the node hosting the current (or last) workspace Pod, used for soft affinity.
 	NodeName string `json:"nodeName,omitempty"`
 
-	// Operation tracks an in-flight snapshot/recreate/restore operation for crash recovery.
+	// Operation tracks an in-flight snapshot/recreate/suspend operation for crash recovery.
 	Operation *OperationStatus `json:"operation,omitempty"`
-
-	// Snapshots holds the retained snapshot revision history.
-	Snapshots []SnapshotRecord `json:"snapshots,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=gws
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="Paused",type=boolean,JSONPath=`.spec.paused`
-// +kubebuilder:printcolumn:name="Rev",type=integer,JSONPath=`.status.currentRevision`
+// +kubebuilder:printcolumn:name="Suspend",type=boolean,JSONPath=`.spec.suspend`
+// +kubebuilder:printcolumn:name="Seq",type=integer,JSONPath=`.status.snapshotSeq`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.nodeName`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

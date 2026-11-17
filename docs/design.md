@@ -147,39 +147,27 @@ flowchart TB
   - `template.spec.containers[0].image` is the initial base image, resolved to a platform-specific digest (`status.baseImageDigest`) for revision `0`. MVP rejects base image changes after initialization.
   - Any other template change (e.g. `nvidia.com/gpu` limits `0 ↔ 1`, CPU/memory, `env`, `securityContext`, scheduling) while `Running` triggers a snapshot-then-recreate cycle.
 - `volumeClaimTemplates` (`[]corev1.PersistentVolumeClaim`, optional): Follows the LWS / StatefulSet convention for operator-managed PVCs (e.g. specifying `storageClassName` and capacity). Created PVCs are named `<workspace>-<claimName>`, retained across `Paused` and `Recreate` transitions, and automatically bound to matching `volumeMounts`. Existing PVCs can still be referenced directly in `template.spec.volumes`.
-- `paused` (`bool`, default `false`): When `true`, snapshots the running workspace and deletes the Pod to release compute/GPU resources (while keeping PVCs). On snapshot failure, the Pod is **retained** and a `Condition` is surfaced rather than entering `Paused`.
-- `restore` (`*RestoreRequest`, optional): One-shot rollback request containing `requestID` (`string`, non-empty) and `revision` (`int64`, `>= 0`, where `0` is the base image). Processed once per `requestID` (`status.observedRestoreRequestID`). Rollback only restores rootfs, never PVC contents or process/GPU memory.
-- `registry` (`RegistrySpec`, required):
-  - `repository` (`string`, non-empty): Target OCI repository prefix (e.g. `registry.crema-system.svc:5000/workspaces`).
-  - `secretRef` (`*corev1.LocalObjectReference`, optional): `kubernetes.io/dockerconfigjson` secret for registry auth.
-  - `plainHTTP` (`bool`, default `false`): Use plain HTTP (for local dev registries).
-  - `insecureSkipTLSVerify` (`bool`, default `false`): Skip TLS certificate verification.
-- `snapshotPolicy` (`SnapshotPolicy`, optional):
-  - `retentionLimit` (`int32`, default `5`): Maximum number of retained snapshot records in `status.snapshots` (protected revisions such as `currentRevision` and active `operation.targetRevision` are never pruned; physical blob reclamation depends on OCI registry GC).
-  - `compression` (`string`, enum `zstd` | `gzip`, default `zstd`).
-  - `snapshotTrigger` (`string`, optional): Changing this value triggers an on-demand snapshot without recreating the Pod.
+- `paused` / `suspend` (`bool`, default `false`): When `suspend: true`, snapshots the running workspace and deletes the Pod to release compute/GPU resources (while keeping PVCs). On snapshot failure, the Pod is **retained** and a `Condition` is surfaced rather than entering `Suspended`.
+- `registryRef` (`*corev1.LocalObjectReference`, optional): References a cluster-scoped `SnapshotRegistry` (defaults to `"default"`).
+  - `SnapshotRegistry.spec.repository` (`string`, non-empty): Target OCI repository prefix (e.g. `registry.crema-system.svc:5000/workspaces`).
+  - `SnapshotRegistry.spec.secretRef` (`*corev1.SecretReference`, optional): `kubernetes.io/dockerconfigjson` secret for registry auth.
+  - `SnapshotRegistry.spec.plainHTTP` (`bool`, default `false`): Use plain HTTP (for local dev registries).
+  - `SnapshotRegistry.spec.insecureSkipTLSVerify` (`bool`, default `false`): Skip TLS certificate verification.
 
 ### `GPUWorkspaceStatus`
-- `phase` (`Phase`): `Pending` | `Running` | `Snapshotting` | `Paused` | `Recreating` | `Failed`
+- `phase` (`Phase`): `Pending` | `Running` | `Snapshotting` | `Suspended` | `Recreating` | `Failed`
 - `conditions` (`[]metav1.Condition`, `+listType=map`, `+listMapKey=type`): Standard K8s conditions (`Ready`, `SnapshotReady`, `TemplateValid`, `Degraded`).
 - `observedGeneration` (`int64`)
-- `baseImage` (`string`) & `baseImageDigest` (`string`): Resolved immutable image reference for revision `0`.
-- `currentImage` (`string`): Effective image currently running (or ready to resume from when `Paused`).
-- `currentRevision` (`int64`): Active revision number (`0` for initial base image).
-- `lastAllocatedRevision` (`int64`): Monotonic high-watermark allocation counter; rollback and history pruning never reuse revision numbers.
+- `baseImage` (`string`) & `baseImageDigest` (`string`): Resolved immutable base image reference.
+- `currentImage` (`string`): Active immutable OCI image reference (base image or latest snapshot).
+- `snapshotSeq` (`int64`): Monotonic counter used to generate unique OCI tags (`rev-1`, `rev-2`, ...).
 - `appliedTemplateHash` (`string`): Hash of the last applied `spec.template` (excluding immutable base image), used to detect template changes.
-- `observedRestoreRequestID` (`string`): Tracks the last processed `spec.restore.requestID`.
-- `lastSnapshotTrigger` (`string`): Tracks processed manual trigger.
 - `podName` (`string`), `nodeName` (`string`)
 - `operation` (`*OperationStatus`, optional): Durable in-flight operation record, persisted before invoking `crema-agent`:
-  - `id` (`string`), `type` (`Snapshot` | `Recreate` | `Pause` | `Restore`), `stage` (`Committing` | `Committed` | `Recreating`)
+  - `id` (`string`), `type` (`Recreate` | `Suspend`), `stage` (`Committing` | `Committed` | `Recreating`)
   - `sourcePodUID` (`string`), `containerID` (`string`), `nodeName` (`string`)
-  - `generation` (`int64`), `reason` (`string`), `targetRevision` (`*int64`)
+  - `generation` (`int64`), `reason` (`string`), `targetSeq` (`int64`)
   - `committedImage` (`string`, optional), `quiescenceDeadline` (`metav1.Time`, optional)
-- `snapshots` (`[]SnapshotRecord`):
-  - `revision` (`int64`), `parentRevision` (`*int64`, optional — tracks branch lineage after rollbacks)
-  - `image` (`string`), `layerDigest` (`string`), `layerSizeBytes` (`int64`)
-  - `reason` (`string`: `TemplateChange` | `Pause` | `Manual`), `createdAt` (`metav1.Time`)
 
 ---
 
@@ -190,17 +178,14 @@ flowchart TB
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: Create GPUWorkspace
-    Pending --> Running: Pod Ready (rev 0)
-    Running --> Snapshotting: template changed / paused=true / manual trigger
-    Snapshotting --> Paused: paused=true (commit ok, Pod deleted)
+    Pending --> Running: Pod Ready
+    Running --> Snapshotting: template changed / suspend=true
+    Snapshotting --> Suspended: suspend=true (commit ok, Pod deleted)
     Snapshotting --> Recreating: template changed (commit ok, Pod recreated)
-    Snapshotting --> Running: manual trigger (commit ok)
     Snapshotting --> Failed: commit error (retain Pod, retry with backoff)
     Recreating --> Running: Replacement Pod Ready
-    Paused --> Recreating: paused=false (recreate from currentImage)
-    Running --> Recreating: restore.requestID changed (rollback, no new commit)
-    Paused --> Paused: restore.requestID changed (update currentImage)
-    Pending --> Paused: paused=true (no Pod needed)
+    Suspended --> Recreating: suspend=false (recreate from currentImage)
+    Pending --> Suspended: suspend=true (no Pod needed)
     Failed --> Snapshotting: Retry capture on surviving source
     Failed --> Recreating: Retry replacement from recorded image
 ```

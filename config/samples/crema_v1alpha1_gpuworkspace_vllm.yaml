@@ -1,0 +1,51 @@
+apiVersion: crema.kubebottle.io/v1alpha1
+kind: GPUWorkspace
+metadata:
+  name: vllm-llama3
+spec:
+  suspend: false
+  volumeClaimTemplates:
+    - metadata:
+        name: model-cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 100Gi
+  template:
+    spec:
+      runtimeClassName: nvidia
+      containers:
+        - name: workspace
+          image: vllm/vllm-openai:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000 --tensor-parallel-size 2
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "8"
+              memory: "48Gi"
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"

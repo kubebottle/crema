@@ -20,11 +20,11 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .spec.paused
-      name: Paused
+    - jsonPath: .spec.suspend
+      name: Suspend
       type: boolean
-    - jsonPath: .status.currentRevision
-      name: Rev
+    - jsonPath: .status.snapshotSeq
+      name: Seq
       type: integer
     - jsonPath: .status.nodeName
       name: Node
@@ -57,12 +57,6 @@ spec:
           spec:
             description: GPUWorkspaceSpec defines the desired state of GPUWorkspace.
             properties:
-              paused:
-                default: false
-                description: |-
-                  Paused requests a snapshot-safe release of the workspace Pod to free GPUs and compute.
-                  On snapshot failure, the Pod is retained rather than entering Paused.
-                type: boolean
               registryRef:
                 description: |-
                   RegistryRef references a cluster-scoped SnapshotRegistry by name.
@@ -79,55 +73,12 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
-              restore:
-                description: Restore requests a one-shot rollback of the workspace
-                  rootfs to a prior revision.
-                properties:
-                  requestID:
-                    description: RequestID uniquely identifies this restore operation
-                      (e.g. UUID or timestamp).
-                    minLength: 1
-                    type: string
-                  revision:
-                    description: Revision is the target snapshot revision (0 = initial
-                      base image).
-                    format: int64
-                    minimum: 0
-                    type: integer
-                required:
-                - requestID
-                - revision
-                type: object
-              snapshotPolicy:
-                description: SnapshotPolicy configures snapshot compression, retention,
-                  and manual triggers.
-                properties:
-                  compression:
-                    default: zstd
-                    description: Compression specifies the OCI delta layer compression
-                      algorithm.
-                    enum:
-                    - zstd
-                    - gzip
-                    type: string
-                  message:
-                    description: Message attaches an optional human-readable note
-                      to the next snapshot.
-                    type: string
-                  retentionLimit:
-                    default: 5
-                    description: |-
-                      RetentionLimit is the maximum number of snapshot records retained in status.
-                      Protected revisions (such as currentRevision and active operation target) are never pruned.
-                      Underlying blob reclamation depends on the OCI registry's GC policy.
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  snapshotTrigger:
-                    description: SnapshotTrigger triggers an on-demand snapshot whenever
-                      its value changes.
-                    type: string
-                type: object
+              suspend:
+                default: false
+                description: |-
+                  Suspend requests a snapshot-safe release of the workspace Pod to free GPUs and compute.
+                  On snapshot failure, the Pod is retained rather than entering Suspended.
+                type: boolean
               template:
                 description: |-
                   Template defines the Pod used to run the workspace (LWS / AIBrix pattern).
@@ -8157,33 +8108,33 @@ spec:
                   VolumeClaimTemplates optionally defines PVCs created and retained by the
                   workspace lifecycle (following StatefulSet / LWS conventions).
                 items:
-                  description: PersistentVolumeClaim is a user's request for and claim
-                    to a persistent volume
+                  description: VolumeClaimTemplate defines a PVC created and retained
+                    by the workspace lifecycle.
                   properties:
-                    apiVersion:
-                      description: |-
-                        APIVersion defines the versioned schema of this representation of an object.
-                        Servers should convert recognized schemas to the latest internal value, and
-                        may reject unrecognized values.
-                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
-                      type: string
-                    kind:
-                      description: |-
-                        Kind is a string value representing the REST resource this object represents.
-                        Servers may infer this from the endpoint the client submits requests to.
-                        Cannot be updated.
-                        In CamelCase.
-                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-                      type: string
                     metadata:
-                      description: |-
-                        Standard object's metadata.
-                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+                      description: VolumeClaimMetadata defines metadata for an operator-managed
+                        PVC template.
+                      properties:
+                        annotations:
+                          additionalProperties:
+                            type: string
+                          type: object
+                        labels:
+                          additionalProperties:
+                            type: string
+                          type: object
+                        name:
+                          description: Name of the volume claim template; the created
+                            PVC is named <workspace>-<name>.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
                       type: object
                     spec:
                       description: |-
-                        spec defines the desired characteristics of a volume requested by a pod author.
-                        More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims
+                        PersistentVolumeClaimSpec describes the common attributes of storage devices
+                        and allows a Source for provider-specific attributes
                       properties:
                         accessModes:
                           description: |-
@@ -8379,191 +8330,9 @@ spec:
                             PersistentVolume backing this claim.
                           type: string
                       type: object
-                    status:
-                      description: |-
-                        status represents the current information/status of a persistent volume claim.
-                        Read-only.
-                        More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims
-                      properties:
-                        accessModes:
-                          description: |-
-                            accessModes contains the actual access modes the volume backing the PVC has.
-                            More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#access-modes-1
-                          items:
-                            type: string
-                          type: array
-                          x-kubernetes-list-type: atomic
-                        allocatedResourceStatuses:
-                          additionalProperties:
-                            description: |-
-                              When a controller receives persistentvolume claim update with ClaimResourceStatus for a resource
-                              that it does not recognizes, then it should ignore that update and let other controllers
-                              handle it.
-                            type: string
-                          description: "allocatedResourceStatuses stores status of
-                            resource being resized for the given PVC.\nKey names follow
-                            standard Kubernetes label syntax. Valid values are either:\n\t*
-                            Un-prefixed keys:\n\t\t- storage - the capacity of the
-                            volume.\n\t* Custom resources must use implementation-defined
-                            prefixed names such as \"example.com/my-custom-resource\"\nApart
-                            from above values - keys that are unprefixed or have kubernetes.io
-                            prefix are considered\nreserved and hence may not be used.\n\nClaimResourceStatus
-                            can be in any of following states:\n\t- ControllerResizeInProgress:\n\t\tState
-                            set when resize controller starts resizing the volume
-                            in control-plane.\n\t- ControllerResizeFailed:\n\t\tState
-                            set when resize has failed in resize controller with a
-                            terminal error.\n\t- NodeResizePending:\n\t\tState set
-                            when resize controller has finished resizing the volume
-                            but further resizing of\n\t\tvolume is needed on the node.\n\t-
-                            NodeResizeInProgress:\n\t\tState set when kubelet starts
-                            resizing the volume.\n\t- NodeResizeFailed:\n\t\tState
-                            set when resizing has failed in kubelet with a terminal
-                            error. Transient errors don't set\n\t\tNodeResizeFailed.\nFor
-                            example: if expanding a PVC for more capacity - this field
-                            can be one of the following states:\n\t- pvc.status.allocatedResourceStatus['storage']
-                            = \"ControllerResizeInProgress\"\n     - pvc.status.allocatedResourceStatus['storage']
-                            = \"ControllerResizeFailed\"\n     - pvc.status.allocatedResourceStatus['storage']
-                            = \"NodeResizePending\"\n     - pvc.status.allocatedResourceStatus['storage']
-                            = \"NodeResizeInProgress\"\n     - pvc.status.allocatedResourceStatus['storage']
-                            = \"NodeResizeFailed\"\nWhen this field is not set, it
-                            means that no resize operation is in progress for the
-                            given PVC.\n\nA controller that receives PVC update with
-                            previously unknown resourceName or ClaimResourceStatus\nshould
-                            ignore the update for the purpose it was designed. For
-                            example - a controller that\nonly is responsible for resizing
-                            capacity of the volume, should ignore PVC updates that
-                            change other valid\nresources associated with PVC.\n\nThis
-                            is an alpha field and requires enabling RecoverVolumeExpansionFailure
-                            feature."
-                          type: object
-                          x-kubernetes-map-type: granular
-                        allocatedResources:
-                          additionalProperties:
-                            anyOf:
-                            - type: integer
-                            - type: string
-                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                            x-kubernetes-int-or-string: true
-                          description: "allocatedResources tracks the resources allocated
-                            to a PVC including its capacity.\nKey names follow standard
-                            Kubernetes label syntax. Valid values are either:\n\t*
-                            Un-prefixed keys:\n\t\t- storage - the capacity of the
-                            volume.\n\t* Custom resources must use implementation-defined
-                            prefixed names such as \"example.com/my-custom-resource\"\nApart
-                            from above values - keys that are unprefixed or have kubernetes.io
-                            prefix are considered\nreserved and hence may not be used.\n\nCapacity
-                            reported here may be larger than the actual capacity when
-                            a volume expansion operation\nis requested.\nFor storage
-                            quota, the larger value from allocatedResources and PVC.spec.resources
-                            is used.\nIf allocatedResources is not set, PVC.spec.resources
-                            alone is used for quota calculation.\nIf a volume expansion
-                            capacity request is lowered, allocatedResources is only\nlowered
-                            if there are no expansion operations in progress and if
-                            the actual volume capacity\nis equal or lower than the
-                            requested capacity.\n\nA controller that receives PVC
-                            update with previously unknown resourceName\nshould ignore
-                            the update for the purpose it was designed. For example
-                            - a controller that\nonly is responsible for resizing
-                            capacity of the volume, should ignore PVC updates that
-                            change other valid\nresources associated with PVC.\n\nThis
-                            is an alpha field and requires enabling RecoverVolumeExpansionFailure
-                            feature."
-                          type: object
-                        capacity:
-                          additionalProperties:
-                            anyOf:
-                            - type: integer
-                            - type: string
-                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                            x-kubernetes-int-or-string: true
-                          description: capacity represents the actual resources of
-                            the underlying volume.
-                          type: object
-                        conditions:
-                          description: |-
-                            conditions is the current Condition of persistent volume claim. If underlying persistent volume is being
-                            resized then the Condition will be set to 'Resizing'.
-                          items:
-                            description: PersistentVolumeClaimCondition contains details
-                              about state of pvc
-                            properties:
-                              lastProbeTime:
-                                description: lastProbeTime is the time we probed the
-                                  condition.
-                                format: date-time
-                                type: string
-                              lastTransitionTime:
-                                description: lastTransitionTime is the time the condition
-                                  transitioned from one status to another.
-                                format: date-time
-                                type: string
-                              message:
-                                description: message is the human-readable message
-                                  indicating details about last transition.
-                                type: string
-                              reason:
-                                description: |-
-                                  reason is a unique, this should be a short, machine understandable string that gives the reason
-                                  for condition's last transition. If it reports "Resizing" that means the underlying
-                                  persistent volume is being resized.
-                                type: string
-                              status:
-                                description: |-
-                                  Status is the status of the condition.
-                                  Can be True, False, Unknown.
-                                  More info: https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/persistent-volume-claim-v1/#:~:text=state%20of%20pvc-,conditions.status,-(string)%2C%20required
-                                type: string
-                              type:
-                                description: |-
-                                  Type is the type of the condition.
-                                  More info: https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/persistent-volume-claim-v1/#:~:text=set%20to%20%27ResizeStarted%27.-,PersistentVolumeClaimCondition,-contains%20details%20about
-                                type: string
-                            required:
-                            - status
-                            - type
-                            type: object
-                          type: array
-                          x-kubernetes-list-map-keys:
-                          - type
-                          x-kubernetes-list-type: map
-                        currentVolumeAttributesClassName:
-                          description: |-
-                            currentVolumeAttributesClassName is the current name of the VolumeAttributesClass the PVC is using.
-                            When unset, there is no VolumeAttributeClass applied to this PersistentVolumeClaim
-                            This is a beta field and requires enabling VolumeAttributesClass feature (off by default).
-                          type: string
-                        modifyVolumeStatus:
-                          description: |-
-                            ModifyVolumeStatus represents the status object of ControllerModifyVolume operation.
-                            When this is unset, there is no ModifyVolume operation being attempted.
-                            This is a beta field and requires enabling VolumeAttributesClass feature (off by default).
-                          properties:
-                            status:
-                              description: "status is the status of the ControllerModifyVolume
-                                operation. It can be in any of following states:\n
-                                - Pending\n   Pending indicates that the PersistentVolumeClaim
-                                cannot be modified due to unmet requirements, such
-                                as\n   the specified VolumeAttributesClass not existing.\n
-                                - InProgress\n   InProgress indicates that the volume
-                                is being modified.\n - Infeasible\n  Infeasible indicates
-                                that the request has been rejected as invalid by the
-                                CSI driver. To\n\t  resolve the error, a valid VolumeAttributesClass
-                                needs to be specified.\nNote: New statuses can be
-                                added in the future. Consumers should check for unknown
-                                statuses and fail appropriately."
-                              type: string
-                            targetVolumeAttributesClassName:
-                              description: targetVolumeAttributesClassName is the
-                                name of the VolumeAttributesClass the PVC currently
-                                being reconciled
-                              type: string
-                          required:
-                          - status
-                          type: object
-                        phase:
-                          description: phase represents the current phase of PersistentVolumeClaim.
-                          type: string
-                      type: object
+                  required:
+                  - metadata
+                  - spec
                   type: object
                 type: array
             required:
@@ -8581,7 +8350,7 @@ spec:
                 type: string
               baseImageDigest:
                 description: BaseImageDigest is the resolved immutable reference for
-                  revision 0.
+                  the initial base image.
                 type: string
               conditions:
                 description: Conditions represent the latest available observations
@@ -8645,21 +8414,8 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               currentImage:
-                description: CurrentImage is the active OCI image reference (base
-                  image at rev 0, or a snapshot).
-                type: string
-              currentRevision:
-                description: CurrentRevision is the currently active revision number
-                  (0 = base image).
-                format: int64
-                type: integer
-              lastAllocatedRevision:
-                description: LastAllocatedRevision is the monotonic high-watermark
-                  counter for snapshot revisions.
-                format: int64
-                type: integer
-              lastSnapshotTrigger:
-                description: LastSnapshotTrigger tracks the last processed spec.snapshotPolicy.snapshotTrigger.
+                description: CurrentImage is the active immutable OCI image reference
+                  (base image or latest snapshot).
                 type: string
               nodeName:
                 description: NodeName is the node hosting the current (or last) workspace
@@ -8670,11 +8426,8 @@ spec:
                   processed by the controller.
                 format: int64
                 type: integer
-              observedRestoreRequestID:
-                description: ObservedRestoreRequestID tracks the last processed spec.restore.requestID.
-                type: string
               operation:
-                description: Operation tracks an in-flight snapshot/recreate/restore
+                description: Operation tracks an in-flight snapshot/recreate/suspend
                   operation for crash recovery.
                 properties:
                   committedImage:
@@ -8697,7 +8450,7 @@ spec:
                     type: string
                   stage:
                     type: string
-                  targetRevision:
+                  targetSeq:
                     format: int64
                     type: integer
                   type:
@@ -8713,7 +8466,7 @@ spec:
                 - Pending
                 - Running
                 - Snapshotting
-                - Paused
+                - Suspended
                 - Recreating
                 - Failed
                 type: string
@@ -8721,60 +8474,11 @@ spec:
                 description: PodName is the name of the currently active workspace
                   Pod.
                 type: string
-              snapshots:
-                description: Snapshots holds the retained snapshot revision history.
-                items:
-                  description: SnapshotRecord records an immutable OCI snapshot revision
-                    of the workspace rootfs.
-                  properties:
-                    createdAt:
-                      description: CreatedAt is the timestamp when the snapshot was
-                        committed.
-                      format: date-time
-                      type: string
-                    image:
-                      description: Image is the immutable OCI image reference (repo/ns-name:rev-N@sha256:...).
-                      type: string
-                    layerDigest:
-                      description: LayerDigest is the digest of the incremental delta
-                        layer produced in this revision.
-                      type: string
-                    layerSizeBytes:
-                      description: LayerSizeBytes is the compressed size of the incremental
-                        delta layer in bytes.
-                      format: int64
-                      type: integer
-                    message:
-                      description: Message is an optional user-provided note for this
-                        snapshot.
-                      type: string
-                    parentRevision:
-                      description: ParentRevision records the revision from which
-                        this delta branched (0 or nil = base image).
-                      format: int64
-                      type: integer
-                    reason:
-                      description: Reason describes what triggered this snapshot (e.g.
-                        TemplateChange, Pause, Manual).
-                      type: string
-                    revision:
-                      description: Revision is the monotonically allocated snapshot
-                        number (1, 2, ...).
-                      format: int64
-                      type: integer
-                    summary:
-                      description: Summary is a compact diff summary extracted from
-                        the delta tar headers.
-                      type: string
-                  required:
-                  - createdAt
-                  - image
-                  - layerDigest
-                  - layerSizeBytes
-                  - reason
-                  - revision
-                  type: object
-                type: array
+              snapshotSeq:
+                description: SnapshotSeq is a monotonic counter used to generate unique
+                  OCI tags (rev-1, rev-2, ...).
+                format: int64
+                type: integer
             type: object
         type: object
     served: true
