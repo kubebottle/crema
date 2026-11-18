@@ -54,7 +54,7 @@ spec:
       containers:
         - name: workspace
           image: alpine:3.20
-          command: ["sh", "-c", "touch /etc/crema-to-delete && sleep infinity"]
+          command: ["sleep", "infinity"]
           resources:
             limits:
               nvidia.com/gpu: "0"
@@ -73,9 +73,9 @@ spec:
 
 		podName := wsName + "-ws"
 
-		By("mutating rootfs (install jq, write dotfile, delete /etc/crema-to-delete for whiteout)")
+		By("mutating rootfs (install jq, write dotfile, delete /etc/motd for whiteout)")
 		_, err = utils.Run(exec.Command("kubectl", "exec", podName, "-n", wsNS, "--",
-			"sh", "-c", "apk add --no-cache jq && echo 'export CREMA_OK=1' > /root/.profile && rm -f /etc/crema-to-delete"))
+			"sh", "-c", "apk add --no-cache jq && echo 'export CREMA_OK=1' > /root/.profile && rm -f /etc/motd"))
 		Expect(err).NotTo(HaveOccurred())
 
 		By("suspending GPUWorkspace before changing GPU allocation (Strategy B)")
@@ -90,8 +90,8 @@ spec:
 		}, 5*time.Minute, 3*time.Second).Should(Succeed())
 
 		By("scaling nvidia.com/gpu to 1 and resuming GPUWorkspace")
-		_, err = utils.Run(exec.Command("kubectl", "patch", "gws", wsName, "-n", wsNS, "--type=merge",
-			"-p", `{"spec":{"suspend":false,"template":{"spec":{"containers":[{"name":"workspace","resources":{"limits":{"nvidia.com/gpu":"1"}}}]}}}}`))
+		_, err = utils.Run(exec.Command("kubectl", "patch", "gws", wsName, "-n", wsNS, "--type=json",
+			"-p", `[{"op":"replace","path":"/spec/suspend","value":false},{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/nvidia.com~1gpu","value":"1"}]`))
 		Expect(err).NotTo(HaveOccurred())
 
 		By("waiting for resumed Pod with GPU=1 to reach Running")
@@ -103,7 +103,7 @@ spec:
 
 		By("verifying jq, dotfile, and whiteout deletion survived suspend/resize/resume")
 		out, err := utils.Run(exec.Command("kubectl", "exec", podName, "-n", wsNS, "--",
-			"sh", "-c", "jq --version && cat /root/.profile && test ! -e /etc/crema-to-delete && echo WHITEOUT_OK"))
+			"sh", "-c", "jq --version && cat /root/.profile && test ! -e /etc/motd && echo WHITEOUT_OK"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(out).To(ContainSubstring("WHITEOUT_OK"))
 	})

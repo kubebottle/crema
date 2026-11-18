@@ -13,7 +13,11 @@ fi
 
 if ! kind get clusters | grep -qx "${CLUSTER_NAME}"; then
   echo "==> Creating kind cluster ${CLUSTER_NAME}"
-  cat <<EOF | kind create cluster --name "${CLUSTER_NAME}" --config=-
+  NODE_IMAGE_FLAG=()
+  if [ -n "${KIND_NODE_IMAGE:-}" ]; then
+    NODE_IMAGE_FLAG=(--image "${KIND_NODE_IMAGE}")
+  fi
+  cat <<EOF | kind create cluster --name "${CLUSTER_NAME}" "${NODE_IMAGE_FLAG[@]}" --config=-
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -54,7 +58,7 @@ if [ -n "${PROXY_PORT}" ]; then
 fi
 
 echo "==> Applying default SnapshotRegistry (${REGISTRY_NAME}:5000/workspaces)"
-kubectl --context "kind-${CLUSTER_NAME}" apply -f config/crd/bases/
+kubectl --context "kind-${CLUSTER_NAME}" apply --server-side -f config/crd/bases/
 cat <<EOF | kubectl --context "kind-${CLUSTER_NAME}" apply -f -
 apiVersion: crema.kubebottle.io/v1alpha1
 kind: SnapshotRegistry
