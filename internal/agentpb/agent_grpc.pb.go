@@ -20,7 +20,6 @@ const _ = grpc.SupportPackageIsVersion8
 
 const (
 	CremaAgent_CommitContainer_FullMethodName = "/crema.agent.v1alpha1.CremaAgent/CommitContainer"
-	CremaAgent_ConfirmQuiesced_FullMethodName = "/crema.agent.v1alpha1.CremaAgent/ConfirmQuiesced"
 	CremaAgent_Health_FullMethodName          = "/crema.agent.v1alpha1.CremaAgent/Health"
 )
 
@@ -34,9 +33,6 @@ type CremaAgentClient interface {
 	// CommitContainer captures the writable overlayfs delta of a container,
 	// compresses it, appends it to the parent OCI image, and pushes it to the registry.
 	CommitContainer(ctx context.Context, in *CommitContainerRequest, opts ...grpc.CallOption) (*CommitContainerResponse, error)
-	// ConfirmQuiesced verifies that a quiesced capture is still valid and unexpired
-	// before the controller deletes the source Pod.
-	ConfirmQuiesced(ctx context.Context, in *ConfirmQuiescedRequest, opts ...grpc.CallOption) (*ConfirmQuiescedResponse, error)
 	// Health checks agent and containerd connectivity.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
 }
@@ -53,16 +49,6 @@ func (c *cremaAgentClient) CommitContainer(ctx context.Context, in *CommitContai
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CommitContainerResponse)
 	err := c.cc.Invoke(ctx, CremaAgent_CommitContainer_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *cremaAgentClient) ConfirmQuiesced(ctx context.Context, in *ConfirmQuiescedRequest, opts ...grpc.CallOption) (*ConfirmQuiescedResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ConfirmQuiescedResponse)
-	err := c.cc.Invoke(ctx, CremaAgent_ConfirmQuiesced_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -89,9 +75,6 @@ type CremaAgentServer interface {
 	// CommitContainer captures the writable overlayfs delta of a container,
 	// compresses it, appends it to the parent OCI image, and pushes it to the registry.
 	CommitContainer(context.Context, *CommitContainerRequest) (*CommitContainerResponse, error)
-	// ConfirmQuiesced verifies that a quiesced capture is still valid and unexpired
-	// before the controller deletes the source Pod.
-	ConfirmQuiesced(context.Context, *ConfirmQuiescedRequest) (*ConfirmQuiescedResponse, error)
 	// Health checks agent and containerd connectivity.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
 	mustEmbedUnimplementedCremaAgentServer()
@@ -103,9 +86,6 @@ type UnimplementedCremaAgentServer struct {
 
 func (UnimplementedCremaAgentServer) CommitContainer(context.Context, *CommitContainerRequest) (*CommitContainerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CommitContainer not implemented")
-}
-func (UnimplementedCremaAgentServer) ConfirmQuiesced(context.Context, *ConfirmQuiescedRequest) (*ConfirmQuiescedResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ConfirmQuiesced not implemented")
 }
 func (UnimplementedCremaAgentServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Health not implemented")
@@ -141,24 +121,6 @@ func _CremaAgent_CommitContainer_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _CremaAgent_ConfirmQuiesced_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ConfirmQuiescedRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(CremaAgentServer).ConfirmQuiesced(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: CremaAgent_ConfirmQuiesced_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(CremaAgentServer).ConfirmQuiesced(ctx, req.(*ConfirmQuiescedRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _CremaAgent_Health_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(HealthRequest)
 	if err := dec(in); err != nil {
@@ -187,10 +149,6 @@ var CremaAgent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CommitContainer",
 			Handler:    _CremaAgent_CommitContainer_Handler,
-		},
-		{
-			MethodName: "ConfirmQuiesced",
-			Handler:    _CremaAgent_ConfirmQuiesced_Handler,
 		},
 		{
 			MethodName: "Health",

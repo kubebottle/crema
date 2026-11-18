@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -37,10 +36,9 @@ import (
 )
 
 type mockAgentClient struct {
-	commitErr    error
-	confirmValid bool
-	commitCalls  int
-	lastReq      *agentpb.CommitContainerRequest
+	commitErr   error
+	commitCalls int
+	lastReq     *agentpb.CommitContainerRequest
 }
 
 func (m *mockAgentClient) CommitContainer(_ context.Context, _ string, req *agentpb.CommitContainerRequest) (*agentpb.CommitContainerResponse, error) {
@@ -51,21 +49,12 @@ func (m *mockAgentClient) CommitContainer(_ context.Context, _ string, req *agen
 	}
 	digest := fmt.Sprintf("sha256:%064d", m.commitCalls)
 	return &agentpb.CommitContainerResponse{
-		ImageRef:               fmt.Sprintf("%s@%s", req.TargetRepository, digest),
-		ImageDigest:            digest,
-		LayerDigest:            "sha256:layer123",
-		LayerSizeBytes:         4096,
-		DiffSummary:            "~2 (root/.bashrc, usr/bin/jq)",
-		CaptureValid:           true,
-		QuiescenceDeadlineUnix: time.Now().Add(2 * time.Minute).Unix(),
+		ImageRef:       fmt.Sprintf("%s@%s", req.TargetRepository, digest),
+		ImageDigest:    digest,
+		LayerDigest:    "sha256:layer123",
+		LayerSizeBytes: 4096,
+		DiffSummary:    "~2 (root/.bashrc, usr/bin/jq)",
 	}, nil
-}
-
-func (m *mockAgentClient) ConfirmQuiesced(_ context.Context, _ string, _ *agentpb.ConfirmQuiescedRequest) (*agentpb.ConfirmQuiescedResponse, error) {
-	if !m.confirmValid {
-		return &agentpb.ConfirmQuiescedResponse{Valid: false, Reason: "expired"}, nil
-	}
-	return &agentpb.ConfirmQuiescedResponse{Valid: true}, nil
 }
 
 func runReconcileLoop(ctx context.Context, r *GPUWorkspaceReconciler, key types.NamespacedName, steps int) {
@@ -118,7 +107,7 @@ var _ = Describe("GPUWorkspace Controller", func() {
 		}
 	})
 
-	It("reconciles create, template change (GPU scale), commit failure, suspend/resume, and base image immutability", func() {
+	It("enforces suspend-before-resize (Strategy B), retains Pod on commit failure, and restores with soft affinity", func() {
 		wsName := "test-gws-lifecycle"
 		wsKey := types.NamespacedName{Name: wsName, Namespace: "default"}
 		podKey := types.NamespacedName{Name: WorkspacePodName(wsName), Namespace: "default"}
@@ -165,14 +154,14 @@ var _ = Describe("GPUWorkspace Controller", func() {
 			}
 		}()
 
-		agent := &mockAgentClient{confirmValid: true}
+		agent := &mockAgentClient{}
 		r := &GPUWorkspaceReconciler{
 			Client:      k8sClient,
 			Scheme:      k8sClient.Scheme(),
 			AgentClient: agent,
 		}
 
-		// 1. Add finalizer, create PVC & Pod -> Pending.
+		// 1. Add finalizer, create PVC & Pod -> Running on worker-1.
 		runReconcileLoop(ctx, r, wsKey, 2)
 
 		var pvc corev1.PersistentVolumeClaim
@@ -186,31 +175,53 @@ var _ = Describe("GPUWorkspace Controller", func() {
 		Expect(ws.Status.NodeName).To(Equal("worker-1"))
 		Expect(ws.Status.BaseImageDigest).To(ContainSubstring("@sha256:base"))
 
-		// 2. Simulate commit failure when scaling GPU 1 -> 2: Pod must be retained!
-		agent.commitErr = fmt.Errorf("registry unreachable")
+		// 2. Strategy B: modifying GPU while Running (suspend=false) must be rejected without touching the Pod.
 		ws.Spec.Template.Spec.Containers[0].Resources.Limits["nvidia.com/gpu"] = resource.MustParse("2")
 		Expect(k8sClient.Update(ctx, ws)).To(Succeed())
+		runReconcileLoop(ctx, r, wsKey, 1)
 
+		Expect(k8sClient.Get(ctx, wsKey, ws)).To(Succeed())
+		cond := meta.FindStatusCondition(ws.Status.Conditions, condTypeTemplateValid)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("MustSuspendBeforeUpdate"))
+		Expect(agent.commitCalls).To(Equal(0))
+
+		// 3. User sets suspend=true; simulate commit failure first -> Pod must be retained!
+		agent.commitErr = fmt.Errorf("registry unreachable")
+		ws.Spec.Suspend = true
+		Expect(k8sClient.Update(ctx, ws)).To(Succeed())
 		runReconcileLoop(ctx, r, wsKey, 2)
+
 		Expect(k8sClient.Get(ctx, wsKey, ws)).To(Succeed())
 		Expect(ws.Status.Phase).To(Equal(cremav1alpha1.PhaseFailed))
 		var survivingPod corev1.Pod
 		Expect(k8sClient.Get(ctx, podKey, &survivingPod)).To(Succeed())
 
-		// 3. Recover from commit failure: clear error, reconcile -> commits rev-1, deletes old Pod, recreates with soft affinity.
+		// 4. Recover from commit failure -> commits rev-1 with locked SourceImage="ubuntu:22.04", deletes Pod, enters Suspended.
 		agent.commitErr = nil
-		runReconcileLoop(ctx, r, wsKey, 3)
+		runReconcileLoop(ctx, r, wsKey, 2) // Committing -> Committed -> Delete(Pod)
+		Expect(agent.lastReq).NotTo(BeNil())
+		Expect(agent.lastReq.ParentImageRef).To(Equal("ubuntu:22.04"))
 
-		// Verify old Pod is terminating and simulate kubelet completing termination.
 		Expect(k8sClient.Get(ctx, podKey, &survivingPod)).To(Succeed())
 		Expect(survivingPod.DeletionTimestamp).NotTo(BeNil())
 		Expect(k8sClient.Delete(ctx, &survivingPod, client.GracePeriodSeconds(0))).To(Succeed())
 
-		// Next reconcile advances to Recreating and creates replacement Pod with rev-1 image and soft node affinity.
-		runReconcileLoop(ctx, r, wsKey, 2)
+		runReconcileLoop(ctx, r, wsKey, 1) // Pod gone -> Suspended
+		Expect(k8sClient.Get(ctx, wsKey, ws)).To(Succeed())
+		Expect(ws.Status.Phase).To(Equal(cremav1alpha1.PhaseSuspended))
+		Expect(ws.Status.SnapshotSeq).To(Equal(int64(1)))
+		Expect(ws.Status.CurrentImage).To(ContainSubstring("registry.crema-system.svc:5000/workspaces/default-" + wsName + "@sha256:"))
+
+		// 5. Resume with updated GPU=2 -> recreates Pod with rev-1 image, gpu=2, and soft affinity to worker-1.
+		ws.Spec.Suspend = false
+		Expect(k8sClient.Update(ctx, ws)).To(Succeed())
+		runReconcileLoop(ctx, r, wsKey, 1)
+
 		var newPod corev1.Pod
 		Expect(k8sClient.Get(ctx, podKey, &newPod)).To(Succeed())
-		Expect(newPod.Spec.Containers[0].Image).To(ContainSubstring("registry.crema-system.svc:5000/workspaces/default-" + wsName + "@sha256:"))
+		Expect(newPod.Spec.Containers[0].Image).To(Equal(ws.Status.CurrentImage))
 		Expect(newPod.Spec.Containers[0].Resources.Limits["nvidia.com/gpu"]).To(Equal(resource.MustParse("2")))
 		Expect(newPod.Spec.Affinity).NotTo(BeNil())
 		Expect(newPod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].Preference.MatchExpressions[0].Values).To(ContainElement("worker-1"))
@@ -219,38 +230,13 @@ var _ = Describe("GPUWorkspace Controller", func() {
 		runReconcileLoop(ctx, r, wsKey, 1)
 		Expect(k8sClient.Get(ctx, wsKey, ws)).To(Succeed())
 		Expect(ws.Status.Phase).To(Equal(cremav1alpha1.PhaseRunning))
-		Expect(ws.Status.SnapshotSeq).To(Equal(int64(1)))
-
-		// 4. Suspend -> commits rev-2, deletes Pod, enters Suspended; PVC remains intact.
-		ws.Spec.Suspend = true
-		Expect(k8sClient.Update(ctx, ws)).To(Succeed())
-		runReconcileLoop(ctx, r, wsKey, 3)
-
-		Expect(k8sClient.Get(ctx, podKey, &newPod)).To(Succeed())
-		Expect(newPod.DeletionTimestamp).NotTo(BeNil())
-		Expect(k8sClient.Delete(ctx, &newPod, client.GracePeriodSeconds(0))).To(Succeed())
-		runReconcileLoop(ctx, r, wsKey, 2)
-
-		Expect(k8sClient.Get(ctx, wsKey, ws)).To(Succeed())
-		Expect(ws.Status.Phase).To(Equal(cremav1alpha1.PhaseSuspended))
-		Expect(ws.Status.SnapshotSeq).To(Equal(int64(2)))
-		Expect(errors.IsNotFound(k8sClient.Get(ctx, podKey, &newPod))).To(BeTrue())
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: WorkspacePVCName(wsName, "data"), Namespace: "default"}, &pvc)).To(Succeed())
-
-		// 5. Resume (suspend: false) -> recreates Pod from rev-2 image.
-		ws.Spec.Suspend = false
-		Expect(k8sClient.Update(ctx, ws)).To(Succeed())
-		runReconcileLoop(ctx, r, wsKey, 1)
-		Expect(k8sClient.Get(ctx, podKey, &newPod)).To(Succeed())
-		Expect(newPod.Spec.Containers[0].Image).To(Equal(ws.Status.CurrentImage))
 
 		// 6. Reject base image mutation.
-		Expect(k8sClient.Get(ctx, wsKey, ws)).To(Succeed())
 		ws.Spec.Template.Spec.Containers[0].Image = "debian:12"
 		Expect(k8sClient.Update(ctx, ws)).To(Succeed())
 		runReconcileLoop(ctx, r, wsKey, 1)
 		Expect(k8sClient.Get(ctx, wsKey, ws)).To(Succeed())
-		cond := meta.FindStatusCondition(ws.Status.Conditions, condTypeTemplateValid)
+		cond = meta.FindStatusCondition(ws.Status.Conditions, condTypeTemplateValid)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal("BaseImageImmutable"))

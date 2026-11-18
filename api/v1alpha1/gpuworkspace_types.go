@@ -78,20 +78,20 @@ type GPUWorkspaceSpec struct {
 	RegistryRef *corev1.LocalObjectReference `json:"registryRef,omitempty"`
 }
 
-// OperationStatus persists an in-flight snapshot/recreate/suspend operation before
+// OperationStatus persists an in-flight suspend/commit operation before
 // mutating external state (agent commit or Pod deletion), enabling crash-safe retries.
 type OperationStatus struct {
-	ID                 string       `json:"id"`
-	Type               string       `json:"type"`  // Recreate | Suspend
-	Stage              string       `json:"stage"` // Committing | Committed | Recreating
-	SourcePodUID       string       `json:"sourcePodUID,omitempty"`
-	ContainerID        string       `json:"containerID,omitempty"`
-	NodeName           string       `json:"nodeName,omitempty"`
-	Generation         int64        `json:"generation,omitempty"`
-	Reason             string       `json:"reason,omitempty"`
-	TargetSeq          int64        `json:"targetSeq,omitempty"`
-	CommittedImage     string       `json:"committedImage,omitempty"`
-	QuiescenceDeadline *metav1.Time `json:"quiescenceDeadline,omitempty"`
+	ID             string `json:"id"`
+	Type           string `json:"type"`  // Suspend
+	Stage          string `json:"stage"` // Committing | Committed
+	SourcePodUID   string `json:"sourcePodUID,omitempty"`
+	SourceImage    string `json:"sourceImage,omitempty"`
+	ContainerID    string `json:"containerID,omitempty"`
+	NodeName       string `json:"nodeName,omitempty"`
+	Generation     int64  `json:"generation,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	TargetSeq      int64  `json:"targetSeq,omitempty"`
+	CommittedImage string `json:"committedImage,omitempty"`
 }
 
 // GPUWorkspaceStatus defines the observed state of GPUWorkspace.

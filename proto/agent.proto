@@ -11,10 +11,6 @@ service CremaAgent {
   // compresses it, appends it to the parent OCI image, and pushes it to the registry.
   rpc CommitContainer(CommitContainerRequest) returns (CommitContainerResponse);
 
-  // ConfirmQuiesced verifies that a quiesced capture is still valid and unexpired
-  // before the controller deletes the source Pod.
-  rpc ConfirmQuiesced(ConfirmQuiescedRequest) returns (ConfirmQuiescedResponse);
-
   // Health checks agent and containerd connectivity.
   rpc Health(HealthRequest) returns (HealthResponse);
 }
@@ -45,10 +41,9 @@ message CommitContainerRequest {
   bool insecure_skip_tls_verify = 14;
   bytes docker_config_json = 15;
 
-  // If true, keep the container task paused until Pod termination or watchdog deadline.
-  // If false (e.g. manual snapshot), resume immediately after diff capture.
+  // If true, keep the container task paused after commit until the controller deletes the Pod.
+  // On commit failure, the task is always resumed immediately.
   bool keep_quiesced = 16;
-  int64 quiescence_timeout_seconds = 17;
 }
 
 message CommitContainerResponse {
@@ -62,22 +57,6 @@ message CommitContainerResponse {
 
   // Compact diff summary extracted from delta tar headers.
   string diff_summary = 5;
-
-  // True if the capture is valid (for keep_quiesced=true, task is still frozen and unexpired).
-  bool capture_valid = 6;
-  int64 quiescence_deadline_unix = 7;
-}
-
-message ConfirmQuiescedRequest {
-  string operation_id = 1;
-  string pod_uid = 2;
-  string container_id = 3;
-}
-
-message ConfirmQuiescedResponse {
-  bool valid = 1;
-  string reason = 2;
-  int64 quiescence_deadline_unix = 3;
 }
 
 message HealthRequest {}

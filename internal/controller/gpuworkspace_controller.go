@@ -42,16 +42,13 @@ import (
 const (
 	workspaceFinalizer        = "crema.kubebottle.io/finalizer"
 	defaultRegistryName       = "default"
-	defaultQuiescenceSeconds  = 120
 	condTypeReady             = "Ready"
 	condTypeSnapshotReady     = "SnapshotReady"
 	condTypeTemplateValid     = "TemplateValid"
 	condTypeDegraded          = "Degraded"
-	opTypeRecreate            = "Recreate"
 	opTypeSuspend             = "Suspend"
 	opStageCommitting         = "Committing"
 	opStageCommitted          = "Committed"
-	opStageRecreating         = "Recreating"
 	requeueAfterDeleteWait    = 1 * time.Second
 	requeueAfterCommitFailure = 10 * time.Second
 )
@@ -204,10 +201,15 @@ func (r *GPUWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	// Detect template changes (e.g. GPU 2 -> 4, env, shm, etc.).
+	// Strategy B: refuse template changes while workspace is active; require suspend=true first.
 	if ws.Status.AppliedTemplateHash != "" && ws.Status.AppliedTemplateHash != templateHash {
-		if containerID, ok := mainContainerID(pod); ok && pod.Spec.NodeName != "" {
-			return r.startOperation(ctx, &ws, pod, containerID, opTypeRecreate, "TemplateChange")
+		if _, ok := mainContainerID(pod); ok {
+			setCondition(&ws, condTypeTemplateValid, metav1.ConditionFalse, "MustSuspendBeforeUpdate",
+				"cannot modify spec.template while workspace is active; set spec.suspend=true first, wait for Suspended, then update template and resume")
+			if err := r.Status().Update(ctx, &ws); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
 		}
 		// Pod hasn't started container yet; delete and recreate directly.
 		if err := r.deletePodWithUID(ctx, pod); err != nil {
@@ -264,12 +266,17 @@ func (r *GPUWorkspaceReconciler) startOperation(
 	pod *corev1.Pod,
 	containerID, opType, reason string,
 ) (ctrl.Result, error) {
+	sourceImage := ws.Status.CurrentImage
+	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Image != "" {
+		sourceImage = pod.Spec.Containers[0].Image
+	}
 	ws.Status.Phase = cremav1alpha1.PhaseSnapshotting
 	ws.Status.Operation = &cremav1alpha1.OperationStatus{
 		ID:           uuid.NewString(),
 		Type:         opType,
 		Stage:        opStageCommitting,
 		SourcePodUID: string(pod.UID),
+		SourceImage:  sourceImage,
 		ContainerID:  containerID,
 		NodeName:     pod.Spec.NodeName,
 		Generation:   ws.Generation,
@@ -325,9 +332,6 @@ func (r *GPUWorkspaceReconciler) reconcileOperation(ctx context.Context, ws *cre
 		ws.Status.SnapshotSeq = op.TargetSeq
 		op.CommittedImage = resp.ImageRef
 		op.Stage = opStageCommitted
-		if resp.QuiescenceDeadlineUnix > 0 {
-			op.QuiescenceDeadline = &metav1.Time{Time: time.Unix(resp.QuiescenceDeadlineUnix, 0)}
-		}
 		setCondition(ws, condTypeSnapshotReady, metav1.ConditionTrue, "Committed",
 			fmt.Sprintf("committed %s (%s)", resp.ImageDigest, resp.DiffSummary))
 		setCondition(ws, condTypeDegraded, metav1.ConditionFalse, "Healthy", "snapshot committed")
@@ -337,62 +341,21 @@ func (r *GPUWorkspaceReconciler) reconcileOperation(ctx context.Context, ws *cre
 		return ctrl.Result{Requeue: true}, nil
 
 	case opStageCommitted:
-		if pod == nil || string(pod.UID) != op.SourcePodUID {
-			op.Stage = opStageRecreating
-			if err := r.Status().Update(ctx, ws); err != nil {
+		if pod != nil && string(pod.UID) == op.SourcePodUID {
+			if err := r.deletePodWithUID(ctx, pod); err != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: requeueAfterDeleteWait}, nil
 		}
 
-		// Confirm source remains quiesced before deleting it.
-		confirmResp, err := r.AgentClient.ConfirmQuiesced(ctx, op.NodeName, &agentpb.ConfirmQuiescedRequest{
-			OperationId: op.ID,
-			PodUid:      op.SourcePodUID,
-			ContainerId: op.ContainerID,
-		})
-		if err != nil || !confirmResp.GetValid() {
-			reason := ""
-			if err != nil {
-				reason = err.Error()
-			} else {
-				reason = confirmResp.GetReason()
-			}
-			log.Info("quiescence check failed, recapturing snapshot", "operationID", op.ID, "reason", reason)
-			op.Stage = opStageCommitting
-			op.ID = uuid.NewString()
-			op.TargetSeq = ws.Status.SnapshotSeq + 1
-			ws.Status.Phase = cremav1alpha1.PhaseSnapshotting
-			if err := r.Status().Update(ctx, ws); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		if err := r.deletePodWithUID(ctx, pod); err != nil {
-			return ctrl.Result{}, err
-		}
-		ws.Status.Phase = cremav1alpha1.PhaseRecreating
-		if err := r.Status().Update(ctx, ws); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: requeueAfterDeleteWait}, nil
-
-	case opStageRecreating:
-		// If suspend is still desired, finish in Suspended without creating a new Pod.
+		// Source Pod is gone; finalize operation.
+		templateHash, _ := ComputeTemplateHash(ws.Spec.Template)
+		ws.Status.Operation = nil
+		ws.Status.PodName = ""
+		ws.Status.AppliedTemplateHash = templateHash
+		ws.Status.ObservedGeneration = ws.Generation
 		if ws.Spec.Suspend {
-			if pod != nil {
-				if err := r.deletePodWithUID(ctx, pod); err != nil {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{RequeueAfter: requeueAfterDeleteWait}, nil
-			}
-			templateHash, _ := ComputeTemplateHash(ws.Spec.Template)
-			ws.Status.Operation = nil
 			ws.Status.Phase = cremav1alpha1.PhaseSuspended
-			ws.Status.PodName = ""
-			ws.Status.AppliedTemplateHash = templateHash
-			ws.Status.ObservedGeneration = ws.Generation
 			setCondition(ws, condTypeReady, metav1.ConditionFalse, "Suspended", "workspace suspended after snapshot")
 			if err := r.Status().Update(ctx, ws); err != nil {
 				return ctrl.Result{}, err
@@ -400,48 +363,12 @@ func (r *GPUWorkspaceReconciler) reconcileOperation(ctx context.Context, ws *cre
 			return ctrl.Result{}, nil
 		}
 
-		templateHash, err := ComputeTemplateHash(ws.Spec.Template)
-		if err != nil {
+		// User set suspend=false before deletion finished; recreate from CurrentImage.
+		ws.Status.Phase = cremav1alpha1.PhaseRecreating
+		if err := r.Status().Update(ctx, ws); err != nil {
 			return ctrl.Result{}, err
 		}
-		if pod == nil {
-			img := ws.Status.CurrentImage
-			if op.CommittedImage != "" {
-				img = op.CommittedImage
-			}
-			if err := r.createWorkspacePod(ctx, ws, img, templateHash); err != nil {
-				ws.Status.Phase = cremav1alpha1.PhaseFailed
-				setCondition(ws, condTypeDegraded, metav1.ConditionTrue, "PodCreateFailed", err.Error())
-				_ = r.Status().Update(ctx, ws)
-				return ctrl.Result{}, err
-			}
-			ws.Status.Phase = cremav1alpha1.PhaseRecreating
-			ws.Status.PodName = WorkspacePodName(ws.Name)
-			ws.Status.AppliedTemplateHash = templateHash
-			ws.Status.ObservedGeneration = ws.Generation
-			if err := r.Status().Update(ctx, ws); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
-
-		ws.Status.PodName = pod.Name
-		if pod.Spec.NodeName != "" {
-			ws.Status.NodeName = pod.Spec.NodeName
-		}
-		if isPodReady(pod) {
-			ws.Status.Operation = nil
-			ws.Status.Phase = cremav1alpha1.PhaseRunning
-			ws.Status.AppliedTemplateHash = templateHash
-			ws.Status.ObservedGeneration = ws.Generation
-			setCondition(ws, condTypeReady, metav1.ConditionTrue, "PodReady", "replacement workspace Pod is Ready")
-			setCondition(ws, condTypeDegraded, metav1.ConditionFalse, "Healthy", "workspace is healthy")
-			if err := r.Status().Update(ctx, ws); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{Requeue: true}, nil
 
 	default:
 		ws.Status.Operation = nil
@@ -488,24 +415,28 @@ func (r *GPUWorkspaceReconciler) invokeAgentCommit(
 	targetRepo := strings.TrimSuffix(sreg.Spec.Repository, "/") + "/" + ws.Namespace + "-" + ws.Name
 	targetTag := fmt.Sprintf("rev-%d", op.TargetSeq)
 
+	parentImage := op.SourceImage
+	if parentImage == "" {
+		parentImage = ws.Status.CurrentImage
+	}
+
 	return r.AgentClient.CommitContainer(ctx, op.NodeName, &agentpb.CommitContainerRequest{
-		OperationId:              op.ID,
-		WorkspaceUid:             string(ws.UID),
-		WorkspaceNamespace:       ws.Namespace,
-		WorkspaceName:            ws.Name,
-		PodName:                  pod.Name,
-		PodUid:                   string(pod.UID),
-		ContainerName:            ws.Spec.Template.Spec.Containers[0].Name,
-		ContainerId:              op.ContainerID,
-		TargetRepository:         targetRepo,
-		TargetTag:                targetTag,
-		ParentImageRef:           ws.Status.CurrentImage,
-		Compression:              "zstd",
-		PlainHttp:                sreg.Spec.PlainHTTP,
-		InsecureSkipTlsVerify:    sreg.Spec.InsecureSkipTLSVerify,
-		DockerConfigJson:         dockerConfigJSON,
-		KeepQuiesced:             true,
-		QuiescenceTimeoutSeconds: defaultQuiescenceSeconds,
+		OperationId:           op.ID,
+		WorkspaceUid:          string(ws.UID),
+		WorkspaceNamespace:    ws.Namespace,
+		WorkspaceName:         ws.Name,
+		PodName:               pod.Name,
+		PodUid:                string(pod.UID),
+		ContainerName:         ws.Spec.Template.Spec.Containers[0].Name,
+		ContainerId:           op.ContainerID,
+		TargetRepository:      targetRepo,
+		TargetTag:             targetTag,
+		ParentImageRef:        parentImage,
+		Compression:           "zstd",
+		PlainHttp:             sreg.Spec.PlainHTTP,
+		InsecureSkipTlsVerify: sreg.Spec.InsecureSkipTLSVerify,
+		DockerConfigJson:      dockerConfigJSON,
+		KeepQuiesced:          true,
 	})
 }
 

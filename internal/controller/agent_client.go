@@ -32,13 +32,11 @@ import (
 const (
 	defaultAgentPort     = 9090
 	defaultCommitTimeout = 10 * time.Minute
-	defaultConfirmTimout = 15 * time.Second
 )
 
 // AgentClient abstracts node-local crema-agent RPCs for testability.
 type AgentClient interface {
 	CommitContainer(ctx context.Context, nodeName string, req *agentpb.CommitContainerRequest) (*agentpb.CommitContainerResponse, error)
-	ConfirmQuiesced(ctx context.Context, nodeName string, req *agentpb.ConfirmQuiescedRequest) (*agentpb.ConfirmQuiescedResponse, error)
 }
 
 // GRPCAgentClient discovers the Ready crema-agent Pod on a target node and calls its gRPC endpoint.
@@ -103,24 +101,6 @@ func (c *GRPCAgentClient) CommitContainer(ctx context.Context, nodeName string, 
 	defer cancel()
 
 	return agentpb.NewCremaAgentClient(conn).CommitContainer(callCtx, req)
-}
-
-func (c *GRPCAgentClient) ConfirmQuiesced(ctx context.Context, nodeName string, req *agentpb.ConfirmQuiescedRequest) (*agentpb.ConfirmQuiescedResponse, error) {
-	addr, err := c.resolveAgentAddress(ctx, nodeName)
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("dial crema-agent %s: %w", addr, err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	callCtx, cancel := context.WithTimeout(ctx, defaultConfirmTimout)
-	defer cancel()
-
-	return agentpb.NewCremaAgentClient(conn).ConfirmQuiesced(callCtx, req)
 }
 
 func isPodReady(pod *corev1.Pod) bool {

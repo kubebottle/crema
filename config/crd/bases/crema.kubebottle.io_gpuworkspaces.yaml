@@ -8441,10 +8441,9 @@ spec:
                     type: string
                   nodeName:
                     type: string
-                  quiescenceDeadline:
-                    format: date-time
-                    type: string
                   reason:
+                    type: string
+                  sourceImage:
                     type: string
                   sourcePodUID:
                     type: string

@@ -78,25 +78,7 @@ spec:
 			"sh", "-c", "apk add --no-cache jq && echo 'export CREMA_OK=1' > /root/.profile && rm -f /etc/crema-to-delete"))
 		Expect(err).NotTo(HaveOccurred())
 
-		By("scaling nvidia.com/gpu from 0 to 1")
-		_, err = utils.Run(exec.Command("kubectl", "patch", "gws", wsName, "-n", wsNS, "--type=merge",
-			"-p", `{"spec":{"template":{"spec":{"containers":[{"name":"workspace","resources":{"limits":{"nvidia.com/gpu":"1"}}}]}}}}`))
-		Expect(err).NotTo(HaveOccurred())
-
-		By("waiting for snapshotSeq=1 and Running on GPU node")
-		Eventually(func(g Gomega) {
-			out, err := utils.Run(exec.Command("kubectl", "get", "gws", wsName, "-n", wsNS, "-o", "jsonpath={.status.phase}:{.status.snapshotSeq}"))
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(strings.TrimSpace(out)).To(Equal("Running:1"))
-		}, 5*time.Minute, 3*time.Second).Should(Succeed())
-
-		By("verifying jq, dotfile, and whiteout deletion survived recreation")
-		out, err := utils.Run(exec.Command("kubectl", "exec", podName, "-n", wsNS, "--",
-			"sh", "-c", "jq --version && cat /root/.profile && test ! -e /etc/crema-to-delete && echo WHITEOUT_OK"))
-		Expect(err).NotTo(HaveOccurred())
-		Expect(out).To(ContainSubstring("WHITEOUT_OK"))
-
-		By("suspending GPUWorkspace to release GPU")
+		By("suspending GPUWorkspace before changing GPU allocation (Strategy B)")
 		_, err = utils.Run(exec.Command("kubectl", "patch", "gws", wsName, "-n", wsNS, "--type=merge",
 			"-p", `{"spec":{"suspend":true}}`))
 		Expect(err).NotTo(HaveOccurred())
@@ -104,23 +86,25 @@ spec:
 		Eventually(func(g Gomega) {
 			out, err := utils.Run(exec.Command("kubectl", "get", "gws", wsName, "-n", wsNS, "-o", "jsonpath={.status.phase}:{.status.snapshotSeq}"))
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(strings.TrimSpace(out)).To(Equal("Suspended:2"))
+			g.Expect(strings.TrimSpace(out)).To(Equal("Suspended:1"))
 		}, 5*time.Minute, 3*time.Second).Should(Succeed())
 
-		By("resuming GPUWorkspace and verifying rootfs remains intact")
+		By("scaling nvidia.com/gpu to 1 and resuming GPUWorkspace")
 		_, err = utils.Run(exec.Command("kubectl", "patch", "gws", wsName, "-n", wsNS, "--type=merge",
-			"-p", `{"spec":{"suspend":false}}`))
+			"-p", `{"spec":{"suspend":false,"template":{"spec":{"containers":[{"name":"workspace","resources":{"limits":{"nvidia.com/gpu":"1"}}}]}}}}`))
 		Expect(err).NotTo(HaveOccurred())
 
+		By("waiting for resumed Pod with GPU=1 to reach Running")
 		Eventually(func(g Gomega) {
-			out, err := utils.Run(exec.Command("kubectl", "get", "gws", wsName, "-n", wsNS, "-o", "jsonpath={.status.phase}"))
+			out, err := utils.Run(exec.Command("kubectl", "get", "gws", wsName, "-n", wsNS, "-o", "jsonpath={.status.phase}:{.status.snapshotSeq}"))
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(strings.TrimSpace(out)).To(Equal("Running"))
-		}, 3*time.Minute, 2*time.Second).Should(Succeed())
+			g.Expect(strings.TrimSpace(out)).To(Equal("Running:1"))
+		}, 5*time.Minute, 3*time.Second).Should(Succeed())
 
-		out, err = utils.Run(exec.Command("kubectl", "exec", podName, "-n", wsNS, "--",
-			"sh", "-c", "jq --version && test ! -e /etc/crema-to-delete && echo RESUME_OK"))
+		By("verifying jq, dotfile, and whiteout deletion survived suspend/resize/resume")
+		out, err := utils.Run(exec.Command("kubectl", "exec", podName, "-n", wsNS, "--",
+			"sh", "-c", "jq --version && cat /root/.profile && test ! -e /etc/crema-to-delete && echo WHITEOUT_OK"))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(out).To(ContainSubstring("RESUME_OK"))
+		Expect(out).To(ContainSubstring("WHITEOUT_OK"))
 	})
 })

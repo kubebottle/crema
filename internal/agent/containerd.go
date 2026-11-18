@@ -32,32 +32,20 @@ import (
 )
 
 const (
-	k8sNamespace             = "k8s.io"
-	defaultQuiescenceTimeout = 120 * time.Second
-	labelPodUID              = "io.kubernetes.pod.uid"
-	labelPodName             = "io.kubernetes.pod.name"
-	labelPodNamespace        = "io.kubernetes.pod.namespace"
-	labelContainerName       = "io.kubernetes.container.name"
+	k8sNamespace       = "k8s.io"
+	labelPodUID        = "io.kubernetes.pod.uid"
+	labelPodName       = "io.kubernetes.pod.name"
+	labelPodNamespace  = "io.kubernetes.pod.namespace"
+	labelContainerName = "io.kubernetes.container.name"
 )
 
-type quiescedRecord struct {
-	operationID string
-	podUID      string
-	containerID string
-	deadline    time.Time
-	valid       bool
-	reason      string
-	cancelTimer func()
-}
-
 // ContainerdCommitter interacts with containerd over its UNIX socket to capture
-// container rootfs deltas and manage bounded write-quiescence windows.
+// container rootfs deltas and push incremental OCI images.
 type ContainerdCommitter struct {
 	client *containerd.Client
 
-	mu       sync.Mutex
-	opLocks  map[string]*sync.Mutex
-	quiesced map[string]*quiescedRecord
+	mu      sync.Mutex
+	opLocks map[string]*sync.Mutex
 }
 
 // NewContainerdCommitter connects to the given containerd socket path.
@@ -67,9 +55,8 @@ func NewContainerdCommitter(socketPath string) (*ContainerdCommitter, error) {
 		return nil, fmt.Errorf("connect containerd %s: %w", socketPath, err)
 	}
 	return &ContainerdCommitter{
-		client:   cli,
-		opLocks:  make(map[string]*sync.Mutex),
-		quiesced: make(map[string]*quiescedRecord),
+		client:  cli,
+		opLocks: make(map[string]*sync.Mutex),
 	}, nil
 }
 
@@ -104,37 +91,36 @@ func (c *ContainerdCommitter) lockOperation(opID string) func() {
 
 // CommitParams describes a container commit request.
 type CommitParams struct {
-	OperationID       string
-	Namespace         string
-	PodName           string
-	PodUID            string
-	ContainerName     string
-	ContainerID       string
-	ParentImageRef    string
-	TargetRepository  string
-	TargetTag         string
-	Compression       string
-	PlainHTTP         bool
-	InsecureSkipTLS   bool
-	DockerConfigJSON  []byte
-	KeepQuiesced      bool
-	QuiescenceTimeout time.Duration
+	OperationID      string
+	Namespace        string
+	PodName          string
+	PodUID           string
+	ContainerName    string
+	ContainerID      string
+	ParentImageRef   string
+	TargetRepository string
+	TargetTag        string
+	Compression      string
+	PlainHTTP        bool
+	InsecureSkipTLS  bool
+	DockerConfigJSON []byte
+	KeepQuiesced     bool
 }
 
 // CommitOutcome describes the result of committing and pushing a container delta.
 type CommitOutcome struct {
-	ImageRef           string
-	ImageDigest        string
-	LayerDigest        string
-	LayerSizeBytes     int64
-	DiffSummary        string
-	CaptureValid       bool
-	QuiescenceDeadline time.Time
+	ImageRef       string
+	ImageDigest    string
+	LayerDigest    string
+	LayerSizeBytes int64
+	DiffSummary    string
 }
 
 // CommitContainer freezes the container task (if running), extracts the rootfs
-// delta via containerd DiffService.Compare, builds & pushes the OCI image, and
-// manages the quiescence watchdog when KeepQuiesced is true.
+// delta via containerd DiffService.Compare, and builds & pushes the OCI image.
+// On failure, any task paused by this call is resumed immediately so the source Pod
+// remains usable; on success with KeepQuiesced=true, the task stays paused until
+// the controller deletes the Pod.
 func (c *ContainerdCommitter) CommitContainer(ctx context.Context, p CommitParams) (CommitOutcome, error) {
 	if p.OperationID == "" {
 		return CommitOutcome{}, fmt.Errorf("operation_id is required")
@@ -187,7 +173,7 @@ func (c *ContainerdCommitter) CommitContainer(ctx context.Context, p CommitParam
 		return CommitOutcome{}, fmt.Errorf("lookup task %s: %w", containerID, err)
 	}
 
-	// Ensure task is resumed on error or when KeepQuiesced is false.
+	// Always resume on error or when KeepQuiesced is false.
 	keepPaused := false
 	defer func() {
 		if pausedTask != nil && !keepPaused {
@@ -229,8 +215,6 @@ func (c *ContainerdCommitter) CommitContainer(ctx context.Context, p CommitParam
 		_ = c.client.ContentStore().Delete(delCtx, diffDesc.Digest)
 	}()
 
-	// For manual snapshots (KeepQuiesced=false), resume immediately once Compare has
-	// materialized the immutable tar blob in containerd's content store.
 	if !p.KeepQuiesced && pausedTask != nil {
 		if err := pausedTask.Resume(ctx); err == nil {
 			pausedTask = nil
@@ -261,89 +245,17 @@ func (c *ContainerdCommitter) CommitContainer(ctx context.Context, p CommitParam
 		return CommitOutcome{}, fmt.Errorf("push incremental image: %w", err)
 	}
 
-	var deadline time.Time
 	if p.KeepQuiesced {
-		timeout := p.QuiescenceTimeout
-		if timeout <= 0 {
-			timeout = defaultQuiescenceTimeout
-		}
-		deadline = time.Now().Add(timeout)
 		keepPaused = true
-		c.registerQuiesced(p.OperationID, p.PodUID, containerID, deadline, pausedTask)
 	}
 
 	return CommitOutcome{
-		ImageRef:           pushRes.ImageRef,
-		ImageDigest:        pushRes.ImageDigest,
-		LayerDigest:        pushRes.LayerDigest,
-		LayerSizeBytes:     pushRes.LayerSizeBytes,
-		DiffSummary:        stats.String(),
-		CaptureValid:       true,
-		QuiescenceDeadline: deadline,
+		ImageRef:       pushRes.ImageRef,
+		ImageDigest:    pushRes.ImageDigest,
+		LayerDigest:    pushRes.LayerDigest,
+		LayerSizeBytes: pushRes.LayerSizeBytes,
+		DiffSummary:    stats.String(),
 	}, nil
-}
-
-func (c *ContainerdCommitter) registerQuiesced(opID, podUID, containerID string, deadline time.Time, pausedTask containerd.Task) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if prev, ok := c.quiesced[opID]; ok && prev.cancelTimer != nil {
-		prev.cancelTimer()
-	}
-
-	rec := &quiescedRecord{
-		operationID: opID,
-		podUID:      podUID,
-		containerID: containerID,
-		deadline:    deadline,
-		valid:       true,
-	}
-
-	waitDur := time.Until(deadline)
-	timer := time.AfterFunc(waitDur, func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if cur, ok := c.quiesced[opID]; ok && cur == rec && cur.valid {
-			cur.valid = false
-			cur.reason = "quiescence deadline expired"
-			if pausedTask != nil {
-				resumeCtx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), k8sNamespace), 10*time.Second)
-				defer cancel()
-				_ = pausedTask.Resume(resumeCtx)
-			}
-		}
-	})
-	rec.cancelTimer = func() { timer.Stop() }
-	c.quiesced[opID] = rec
-}
-
-// ConfirmQuiesced checks whether the quiesced capture for opID is still valid,
-// unexpired, and matches the source Pod UID and container ID.
-func (c *ContainerdCommitter) ConfirmQuiesced(_ context.Context, opID, podUID, containerID string) (bool, string, time.Time) {
-	containerID = strings.TrimPrefix(containerID, "containerd://")
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	rec, ok := c.quiesced[opID]
-	if !ok {
-		return false, "operation quiescence record not found (agent may have restarted)", time.Time{}
-	}
-	if !rec.valid {
-		return false, rec.reason, rec.deadline
-	}
-	if time.Now().After(rec.deadline) {
-		rec.valid = false
-		rec.reason = "quiescence deadline expired"
-		return false, rec.reason, rec.deadline
-	}
-	if podUID != "" && rec.podUID != podUID {
-		return false, fmt.Sprintf("pod UID mismatch: expected %s, got %s", rec.podUID, podUID), rec.deadline
-	}
-	if containerID != "" && rec.containerID != containerID {
-		return false, fmt.Sprintf("container ID mismatch: expected %s, got %s", rec.containerID, containerID), rec.deadline
-	}
-	return true, "", rec.deadline
 }
 
 func validateContainerIdentity(labels map[string]string, p CommitParams) error {
