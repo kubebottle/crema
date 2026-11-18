@@ -108,6 +108,21 @@ build-agent: fmt vet ## Build crema-agent binary.
 docker-build-agent: ## Build docker image for crema-agent.
 	$(CONTAINER_TOOL) build -f Dockerfile.agent -t ${AGENT_IMG} .
 
+.PHONY: kind-deploy
+kind-deploy: ## Cross-compile Linux binaries, build images, import to kind-crema-dev, and deploy manifests.
+	@ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'); \
+	mkdir -p bin/linux; \
+	CGO_ENABLED=0 GOOS=linux GOARCH=$${ARCH} go build -o bin/linux/manager cmd/main.go; \
+	CGO_ENABLED=0 GOOS=linux GOARCH=$${ARCH} go build -o bin/linux/crema-agent cmd/agent/main.go; \
+	printf 'FROM alpine:3.20\nCOPY manager /manager\nUSER 65532:65532\nENTRYPOINT ["/manager"]\n' | $(CONTAINER_TOOL) build -t ${IMG} -f - bin/linux; \
+	printf 'FROM alpine:3.20\nCOPY crema-agent /crema-agent\nUSER 0:0\nENTRYPOINT ["/crema-agent"]\n' | $(CONTAINER_TOOL) build -t ${AGENT_IMG} -f - bin/linux; \
+	$(CONTAINER_TOOL) save ${IMG} ${AGENT_IMG} -o /tmp/crema-kind-imgs.tar; \
+	for node in $$(kind get nodes --name $${KIND_CLUSTER_NAME:-crema-dev}); do \
+		$(CONTAINER_TOOL) exec -i $${node} ctr -n k8s.io images import - < /tmp/crema-kind-imgs.tar; \
+	done; \
+	rm -f /tmp/crema-kind-imgs.tar; \
+	$(KUBECTL) --context kind-$${KIND_CLUSTER_NAME:-crema-dev} apply --server-side -k config/default
+
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go

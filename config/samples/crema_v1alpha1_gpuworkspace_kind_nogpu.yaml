@@ -1,0 +1,19 @@
+# Demo GPUWorkspace for local kind clusters without physical GPUs.
+# Requires hack/kind/setup.sh (which starts crema-registry:5000, patches mock
+# nvidia.com/gpu=4 on the worker node, and pushes alpine:3.20 to the local registry).
+apiVersion: crema.kubebottle.io/v1alpha1
+kind: GPUWorkspace
+metadata:
+  name: demo-workspace
+  namespace: default
+spec:
+  suspend: false
+  template:
+    spec:
+      containers:
+        - name: workspace
+          image: crema-registry:5000/library/alpine:3.20
+          command: ["sleep", "infinity"]
+          resources:
+            limits:
+              nvidia.com/gpu: "0"
